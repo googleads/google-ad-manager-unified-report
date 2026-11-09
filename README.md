@@ -2,10 +2,7 @@
 
 This Google Apps Script and Google Sheets solution combines your Ad Exchange revenue and your On-Platform Multicall (OPMC) revenue into one report. Use this workbook to view daily trends, compare country performance, and see total revenue for each ad unit.
 
-## Official Google Sheet Template
-
-* **Template Link**: [[MAKE A COPY] Google Ad Manager Unified Report](https://docs.google.com/spreadsheets/d/1N0-iTPXxIw4mv-SkZQc44j55_m9w_OLqE1GMtD2Q19I/copy)
-* Make a copy of the template in your own Google Drive, or attach `Code.js` and `appsscript.json` to an existing Google Sheet.
+When you run the setup function in a blank Google Sheet, the script automatically builds all workbook tabs, formulas, interactive filters, action buttons, and charts for you.
 
 ---
 
@@ -19,7 +16,10 @@ This Google Apps Script and Google Sheets solution combines your Ad Exchange rev
 
 ## 2. One-Time Setup: Google Cloud API and Apps Script
 
-Complete these six steps one time before you run your first report.
+> [!IMPORTANT]
+> You must copy **both** [`appsscript.json`](appsscript.json) and [`Code.js`](Code.js) into your Apps Script project. Without `appsscript.json`, Google Apps Script cannot request Google Ad Manager API permission.
+
+Complete these seven steps one time to set up a new Google Sheet.
 
 1. **Enable the Google Ad Manager API (`Google Cloud Console -> APIs & Services`)**:
    Open your Google Cloud project and enable the [Google Ad Manager API](https://developers.google.com/ad-manager/api/beta) (`admanager.googleapis.com`).
@@ -27,21 +27,37 @@ Complete these six steps one time before you run your first report.
    Ensure your Google account has the **Service Usage Consumer** role (`roles/serviceusage.serviceUsageConsumer`) on that GCP project.
 3. **Copy your GCP Project ID (`Google Cloud Console -> Dashboard`)**:
    Copy your GCP Project ID (or Project Number) from the **Project info** card on the Cloud Console Dashboard.
-4. **Enter your GCP Project ID (`Google Sheet -> Overview Tab -> Cell I8`)**:
-   Open the **Overview** tab, enter your GCP Project ID in cell **I8**, and press **Enter** to save the cell.
-5. **Open the script editor (`Google Sheet -> Extensions -> Apps Script`)**:
-   In the top menu of the sheet, click **Extensions** and then click **Apps Script** to open the script editor.
-6. **Authorize the script (`Apps Script -> Editor < > -> Toolbar`)**:
-   Select `authorizeAndVerifyGamScope` in the top toolbar, click **Run**, and approve the permission prompt.
+4. **Open Apps Script in a new Google Sheet (`Google Sheets -> Extensions -> Apps Script`)**:
+   Create a blank Google Sheet ([sheets.new](https://sheets.new)). In the top menu, click **Extensions** and then click **Apps Script**.
+5. **Enable and paste `appsscript.json` (`Apps Script -> Project Settings -> Editor < >`)**:
+   Click **Project Settings** (the gear icon on the left) and check **Show "appsscript.json" manifest file in editor**. Return to **Editor** (`< >`), open `appsscript.json`, and replace its entire contents with [`appsscript.json`](appsscript.json):
+   ```json
+   {
+     "timeZone": "America/Los_Angeles",
+     "dependencies": {},
+     "exceptionLogging": "STACKDRIVER",
+     "runtimeVersion": "V8",
+     "oauthScopes": [
+       "https://www.googleapis.com/auth/admanager",
+       "https://www.googleapis.com/auth/spreadsheets",
+       "https://www.googleapis.com/auth/script.external_request",
+       "https://www.googleapis.com/auth/script.container.ui"
+     ]
+   }
+   ```
+6. **Paste `Code.js` and save (`Apps Script -> Editor < >`)**:
+   Open `Code.gs` in the editor, replace its entire contents with [`Code.js`](Code.js) from this repository, and click **Save project**.
+7. **Build the workbook and authorize OAuth (`Apps Script -> Editor < > -> Toolbar`)**:
+   Select `authorizeAndVerifyGamScope` in the top toolbar, click **Run**, and approve the permission prompt. The script automatically creates and formats all sheets, formulas, buttons, and charts. Return to your Google Sheet tab and refresh the browser page once (`Cmd+R` or `F5`) to activate the row 10 buttons.
 
 ---
 
 ## 3. How to Generate a Report (Step-by-Step)
 
 1. **Open the Overview tab**:
-   Click the **Overview** tab at the bottom of the sheet.
+   Return to your Google Sheet and click the **Overview** tab at the bottom.
 2. **Enter Network Code and Project ID**:
-   Type your Google Ad Manager Network Code in cell **C7** and your GCP Project ID in cell **I8**, then press **Enter**.
+   Type your Google Ad Manager Network Code in cell **C7** and your GCP Project ID in cell **I7**, then press **Enter**.
 3. **Select your date range**:
    Double-click cell **F7** to select the Start Date and double-click cell **F8** to select the End Date (`YYYY-MM-DD`).
 4. **Run the report**:
@@ -56,7 +72,7 @@ Complete these six steps one time before you run your first report.
 | **Network Code** | `B7` | `C7` | Your Google Ad Manager Network Code. |
 | **Start Date (YYYY-MM-DD)** | `E7` | `F7` | First date of the report. Double-click the cell to open the calendar picker. |
 | **End Date (YYYY-MM-DD)** | `E8` | `F8` | Last date of the report. Double-click the cell to open the calendar picker. |
-| **GCP Project ID (Quota)** | `H8` | `I8` | Your Google Cloud Project ID or Project Number where the Ad Manager API is enabled. |
+| **GCP Project ID (Quota)** | `H7` | `I7` | Your Google Cloud Project ID or Project Number where the Ad Manager API is enabled. |
 
 ---
 

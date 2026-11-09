@@ -98,8 +98,9 @@ const FORMAT_AND_NOISE_WORDS = {
 };
 
 /**
- * Requests OAuth authorization for the Google Ad Manager API, checks the
- * granted scopes, and adds the action buttons to the Overview tab.
+ * Builds the workbook tabs (Overview, Instructions, Ad Unit Breakdown, and hidden data tabs),
+ * requests OAuth authorization for the Google Ad Manager API, checks the granted scopes,
+ * and adds the action buttons to the Overview tab.
  */
 function authorizeAndVerifyGamScope() {
   try {
@@ -111,17 +112,795 @@ function authorizeAndVerifyGamScope() {
         'https://www.googleapis.com/auth/admanager'
       ]);
     }
-  } catch (e) {
-    Logger.log('Note: requireScopes check: ' + e);
+  } catch (e) {}
+
+  try {
+    setupWorkbook_();
+  } catch (setupErr) {
+    Logger.log('Workbook setup note: ' + setupErr);
   }
+
+  try {
+    installDashboardButtons_();
+  } catch (e) {}
+
+  Logger.log('✅ Workbook tabs, formulas, buttons, and charts verified.');
 
   const tokInfo = acquireValidGamToken_('');
   Logger.log('✅ SUCCESS! Google Ad Manager OAuth token acquired via ' + tokInfo.source);
   Logger.log('Granted scopes: ' + tokInfo.scopes);
+  Logger.log('👉 Next step: Switch to your Google Sheet tab and refresh the page once (Cmd+R / F5) to activate the row 10 buttons.');
+
   try {
-    installDashboardButtons_();
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const overview = ss && ss.getSheetByName('Overview');
+    if (overview) {
+      ss.setActiveSheet(overview);
+      ss.toast(
+        'Please refresh this browser tab once (Cmd+R or F5) to activate the row 10 buttons.',
+        '✅ Setup Complete — Refresh Tab Once',
+        -1
+      );
+      SpreadsheetApp.flush();
+    }
   } catch (e) {}
+
   return tokInfo;
+}
+
+/**
+ * Public helper to build all workbook tabs, formulas, dropdowns, charts, and buttons
+ * in a blank Google Sheet without overwriting an already configured workbook.
+ */
+function setupWorkbook() {
+  setupWorkbook_();
+  installDashboardButtons_();
+}
+
+/**
+ * Adjusts a sheet's grid dimensions to match targetRows and targetCols.
+ */
+function ensureSheetGridSize_(sheet, targetRows, targetCols) {
+  if (!sheet) return;
+  const maxCols = sheet.getMaxColumns();
+  if (maxCols > targetCols) {
+    sheet.deleteColumns(targetCols + 1, maxCols - targetCols);
+  } else if (maxCols < targetCols) {
+    sheet.insertColumnsAfter(maxCols, targetCols - maxCols);
+  }
+  const maxRows = sheet.getMaxRows();
+  if (maxRows > targetRows) {
+    sheet.deleteRows(targetRows + 1, maxRows - targetRows);
+  } else if (maxRows < targetRows) {
+    sheet.insertRowsAfter(maxRows, targetRows - maxRows);
+  }
+}
+
+/**
+ * Draws an outer card border around a range and an optional thick top accent bar.
+ */
+function styleCardBox_(range, borderHex, topAccentHex, borderStyle) {
+  if (!range) return;
+  const bStyle = borderStyle || SpreadsheetApp.BorderStyle.SOLID;
+  range.setBorder(true, true, true, true, false, false, borderHex || '#dadce0', bStyle);
+  if (topAccentHex) {
+    const sheet = range.getSheet();
+    sheet
+      .getRange(range.getRow(), range.getColumn(), 1, range.getNumColumns())
+      .setBorder(true, null, null, null, null, null, topAccentHex, SpreadsheetApp.BorderStyle.SOLID_MEDIUM);
+  }
+}
+
+/**
+ * Automatically creates and formats all 7 workbook tabs (Instructions, Overview,
+ * Ad Unit Breakdown, Ad_Unit_Data, Country_Data, Daily_Data, and Chart_Helper),
+ * formulas, dropdowns, and embedded charts when run on a blank Google Sheet.
+ * No-op if Overview and Chart_Helper already exist.
+ */
+function setupWorkbook_() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  if (!ss) return;
+
+  if (
+    ss.getSheetByName('Overview') &&
+    ss.getSheetByName('Chart_Helper') &&
+    ss.getSheetByName('Instructions') &&
+    ss.getSheetByName('Ad Unit Breakdown')
+  ) {
+    return;
+  }
+
+  // 1. Create or configure hidden data and helper sheets first so formula & validation ranges resolve cleanly.
+  let unitSheet = ss.getSheetByName('Ad_Unit_Data') || ss.insertSheet('Ad_Unit_Data');
+  ensureSheetGridSize_(unitSheet, 200, 10);
+  unitSheet.setTabColor('#1a73e8');
+  unitSheet.setFrozenRows(1);
+  unitSheet.getRange('A1:I1').setValues([[
+    'Date', 'Raw_Date', 'Ad_Unit', 'AdX_Revenue', 'OPMC_Revenue',
+    'Total_Revenue', 'AdX_Impressions', 'OPMC_Impressions', 'Total_Impressions'
+  ]]);
+  unitSheet.getRange('A1:I1')
+    .setBackground('#1a73e8')
+    .setFontColor('#ffffff')
+    .setFontFamily('Google Sans')
+    .setFontSize(10)
+    .setFontWeight('bold')
+    .setHorizontalAlignment('center');
+  unitSheet.getRange('D2:F200').setNumberFormat('$#,##0.00');
+  unitSheet.getRange('G2:I200').setNumberFormat('#,##0');
+
+  let countrySheet = ss.getSheetByName('Country_Data') || ss.insertSheet('Country_Data');
+  ensureSheetGridSize_(countrySheet, 200, 10);
+  countrySheet.setTabColor('#f29900');
+  countrySheet.setFrozenRows(1);
+  countrySheet.getRange('A1:I1').setValues([[
+    'Date', 'Raw_Date', 'Country', 'AdX_Revenue', 'OPMC_Revenue',
+    'Total_Revenue', 'AdX_Impressions', 'OPMC_Impressions', 'Total_Impressions'
+  ]]);
+  countrySheet.getRange('A1:I1')
+    .setBackground('#1a73e8')
+    .setFontColor('#ffffff')
+    .setFontFamily('Google Sans')
+    .setFontSize(10)
+    .setFontWeight('bold')
+    .setHorizontalAlignment('center');
+  countrySheet.getRange('D2:F200').setNumberFormat('$#,##0.00');
+  countrySheet.getRange('G2:I200').setNumberFormat('#,##0');
+
+  let dailySheet = ss.getSheetByName('Daily_Data') || ss.insertSheet('Daily_Data');
+  ensureSheetGridSize_(dailySheet, 200, 6);
+  dailySheet.setTabColor('#0f9d58');
+  dailySheet.setFrozenRows(1);
+  dailySheet.getRange('A1:E1').setValues([[
+    'Date', 'Raw_Date', 'Ad Exchange Revenue', 'On-platform multicall Revenue', 'Total Revenue'
+  ]]);
+  dailySheet.getRange('A1:E1')
+    .setBackground('#0f9d58')
+    .setFontColor('#ffffff')
+    .setFontFamily('Google Sans')
+    .setFontSize(10)
+    .setFontWeight('bold')
+    .setHorizontalAlignment('center');
+  dailySheet.getRange('C2:E200').setNumberFormat('$#,##0.00');
+
+  let helperSheet = ss.getSheetByName('Chart_Helper') || ss.insertSheet('Chart_Helper');
+  ensureSheetGridSize_(helperSheet, 260, 15);
+  helperSheet.setTabColor('#9aa0a6');
+  helperSheet.setFrozenRows(1);
+  helperSheet.getRange('A1:M2').setValues([
+    [
+      'Date', 'Total Revenue', 'Ad Exchange Revenue', 'On-platform multicall Revenue', '',
+      'Country', 'Ad Exchange Revenue', 'On-platform multicall Revenue', 'Total Revenue', '',
+      'Ad_Unit_Options', 'Country_Options', 'Currency_Code'
+    ],
+    ['—', 0, 0, 0, '', '—', 0, 0, 0, '', 'ALL', 'ALL', 'USD']
+  ]);
+  helperSheet.getRange('B2:D150').setNumberFormat('$#,##0.00');
+  helperSheet.getRange('G2:I15').setNumberFormat('$#,##0.00');
+
+  // 2. Build the Instructions tab.
+  let instSheet = ss.getSheetByName('Instructions') || ss.insertSheet('Instructions');
+  ensureSheetGridSize_(instSheet, 46, 10);
+  instSheet.setTabColor('#1a73e8');
+  instSheet.setHiddenGridlines(true);
+
+  const instColWidths = [26, 95, 155, 155, 165, 165, 165, 165, 165, 26];
+  for (let c = 0; c < instColWidths.length; c++) {
+    instSheet.setColumnWidth(c + 1, instColWidths[c]);
+  }
+
+  instSheet.getRange('A1:J46')
+    .setBackground('#f1f3f4')
+    .setFontColor('#202124')
+    .setFontFamily('Google Sans')
+    .setFontSize(10)
+    .setVerticalAlignment('middle');
+
+  const instRows = [];
+  for (let r = 0; r < 46; r++) {
+    instRows.push(['', '', '', '', '', '', '', '', '', '']);
+  }
+  instRows[1][1] = 'Google Ad Manager Unified Report: User Guide';
+  instRows[2][1] = 'Author: Francesco Fresta - fresta@google.com';
+  instRows[3][1] = 'This tool combines your Ad Exchange revenue and your On-Platform Multicall (OPMC) revenue into one report. Use this workbook to view daily trends, compare country performance, and see total revenue for each ad unit.';
+
+  instRows[5][1] = '▎ 1. Workbook Tabs';
+  instRows[6][1] = '📊 Overview';
+  instRows[6][3] = 'Run reports, filter data by ad unit or country, view total revenue cards, and check daily, incremental, and country charts.';
+  instRows[7][1] = '🧩 Ad Unit Breakdown';
+  instRows[7][3] = 'View revenue for each Parent Ad Unit (A) combined with its OPMC Child Ad Units (A1, A2, A3, A4).';
+
+  instRows[9][1] = '▎ 2. One-Time Setup: Google Cloud API and Apps Script';
+  instRows[10][1] = 'Step';
+  instRows[10][2] = 'Where to Go';
+  instRows[10][4] = 'What to Do';
+  instRows[11][1] = 'Step 1';
+  instRows[11][2] = 'Google Cloud Console -> APIs & Services';
+  instRows[11][4] = 'Open your Google Cloud project and enable the Google Ad Manager API (admanager.googleapis.com).';
+  instRows[12][1] = 'Step 2';
+  instRows[12][2] = 'Google Cloud Console -> IAM & Admin -> IAM';
+  instRows[12][4] = 'Ensure your Google account has the Service Usage Consumer role (roles/serviceusage.serviceUsageConsumer) on that GCP project.';
+  instRows[13][1] = 'Step 3';
+  instRows[13][2] = 'Google Cloud Console -> Dashboard';
+  instRows[13][4] = 'Copy your GCP Project ID (or Project Number) from the Project info card on the Cloud Console Dashboard.';
+  instRows[14][1] = 'Step 4';
+  instRows[14][2] = 'Google Sheet -> Extensions -> Apps Script';
+  instRows[14][4] = 'In a blank Google Sheet, click Extensions -> Apps Script, enable Show "appsscript.json" manifest file in editor under Project Settings, paste Code.js and appsscript.json, and save.';
+  instRows[15][1] = 'Step 5';
+  instRows[15][2] = 'Apps Script -> Editor (< >) -> Toolbar';
+  instRows[15][4] = 'Select authorizeAndVerifyGamScope in the top toolbar, click Run, and approve the permission prompt to build all workbook tabs.';
+  instRows[16][1] = 'Step 6';
+  instRows[16][2] = 'Google Sheet -> Refresh Page & Cell I7';
+  instRows[16][4] = 'Refresh the Google Sheet browser tab once (Cmd+R or F5) to activate the buttons, enter your GCP Project ID in cell I7, and press Enter.';
+
+  instRows[18][1] = '▎ 3. How to Generate a Report (Step-by-Step)';
+  instRows[19][1] = 'Step';
+  instRows[19][2] = 'Action';
+  instRows[19][4] = 'Instructions';
+  instRows[20][1] = 'Step 1';
+  instRows[20][2] = 'Open the Overview tab';
+  instRows[20][4] = 'Click the Overview tab at the bottom of the sheet.';
+  instRows[21][1] = 'Step 2';
+  instRows[21][2] = 'Enter Network Code and Project ID';
+  instRows[21][4] = 'Type your Google Ad Manager Network Code in cell C7 and your GCP Project ID in cell I7, then press Enter.';
+  instRows[22][1] = 'Step 3';
+  instRows[22][2] = 'Select your date range';
+  instRows[22][4] = 'Double-click cell F7 to select the Start Date and double-click cell F8 to select the End Date (YYYY-MM-DD).';
+  instRows[23][1] = 'Step 4';
+  instRows[23][2] = 'Run the report';
+  instRows[23][4] = 'Click the Generate Report button in row 10. Wait for the Report complete message to appear.';
+
+  instRows[25][1] = '▎ 4. How to Use the Buttons and Filters in the "Overview" tab';
+  instRows[26][1] = 'Button or Filter';
+  instRows[26][3] = 'How to Use It';
+  instRows[27][1] = '⚡ Generate Report';
+  instRows[27][3] = 'Fetch new data from Google Ad Manager and update all charts and tables.';
+  instRows[28][1] = '🔄 Reset Filters';
+  instRows[28][3] = 'Reset both the Ad Unit filter and the Country filter back to ALL.';
+  instRows[29][1] = '📥 Download CSV';
+  instRows[29][3] = 'Download the full report as a CSV file.';
+  instRows[30][1] = '🧹 Clear Data';
+  instRows[30][3] = 'Wipe all fetched report data from all sheets while preserving your settings and formulas.';
+  instRows[31][1] = '📱 Filter by Ad Unit';
+  instRows[31][3] = 'Select an ad unit from the dropdown list in cell C12 to show revenue for that ad unit only.';
+  instRows[32][1] = '🌍 Filter by Country';
+  instRows[32][3] = 'Select a country from the dropdown list in cell F12 to show revenue for that country only.';
+
+  instRows[34][1] = '▎ 5. Key Revenue Terms';
+  instRows[35][1] = 'Term';
+  instRows[35][3] = 'Meaning';
+  instRows[36][1] = 'Ad Exchange Revenue';
+  instRows[36][3] = 'Revenue from standard Google Ad Exchange auctions on your ad units.';
+  instRows[37][1] = 'OPMC Revenue';
+  instRows[37][3] = 'Additional revenue from On-Platform Multicall (OPMC) mediation ad units.';
+  instRows[38][1] = 'Total Revenue';
+  instRows[38][3] = 'The sum of Ad Exchange Revenue plus OPMC Revenue.';
+  instRows[39][1] = 'Parent Ad Unit Rollup';
+  instRows[39][3] = 'On the Ad Unit Breakdown tab, Table 1 groups each Parent Ad Unit (A) with its OPMC Child Ad Units (A1 to A4). If you change a parent name in Table 2 (Column D), Table 1 updates automatically.';
+
+  instRows[41][1] = '▎ 6. Version History & Changelog';
+  instRows[42][1] = 'Version';
+  instRows[42][2] = 'Release Date';
+  instRows[42][3] = 'Key Features & Enhancements (v1.0)';
+  instRows[43][1] = 'v1.0';
+  instRows[43][2] = 'November 2026';
+  instRows[43][3] =
+    'Initial Release (Google Sheets and Apps Script)\n' +
+    '• Google Ad Manager API Integration: Gets Ad Exchange and OPMC report data in parallel from admanager.googleapis.com.\n' +
+    '• Self-Service Workbook Setup: Automatically creates and formats all workbook tabs, charts, formulas, and buttons on first run.\n' +
+    '• Parent Ad Unit Rollup: Groups each Parent Ad Unit (A) with its OPMC Child Ad Units (A1 to A4) on the Ad Unit Breakdown tab.\n' +
+    '• Overview Charts: Shows three charts: Daily Revenue Trends, Stacked Incremental Revenue, and Country Revenue Breakdown.\n' +
+    '• Live Filters: Filters the Overview tab by Ad Unit (C12) or Country (F12) and resets filters with Reset Filters (E10).\n' +
+    '• CSV Export & Clear Data: Exports a four-section CSV via downloadCsvFromSheet() and clears report data safely via clearReportData().';
+
+  instSheet.getRange(1, 1, instRows.length, 10).setValues(instRows);
+
+  instSheet.setRowHeight(1, 16);
+  instSheet.setRowHeight(2, 38);
+  instSheet.setRowHeight(3, 24);
+  instSheet.setRowHeight(4, 44);
+  instSheet.setRowHeight(5, 16);
+  instSheet.setRowHeight(6, 32);
+  instSheet.setRowHeights(7, 2, 30);
+  instSheet.setRowHeight(9, 16);
+  instSheet.setRowHeight(10, 32);
+  instSheet.setRowHeight(11, 28);
+  instSheet.setRowHeights(12, 6, 34);
+  instSheet.setRowHeight(18, 16);
+  instSheet.setRowHeight(19, 32);
+  instSheet.setRowHeight(20, 28);
+  instSheet.setRowHeights(21, 4, 30);
+  instSheet.setRowHeight(25, 16);
+  instSheet.setRowHeight(26, 32);
+  instSheet.setRowHeight(27, 28);
+  instSheet.setRowHeights(28, 6, 30);
+  instSheet.setRowHeight(34, 16);
+  instSheet.setRowHeight(35, 32);
+  instSheet.setRowHeight(36, 28);
+  instSheet.setRowHeights(37, 3, 30);
+  instSheet.setRowHeight(40, 44);
+  instSheet.setRowHeight(41, 16);
+  instSheet.setRowHeight(42, 32);
+  instSheet.setRowHeight(43, 28);
+  instSheet.setRowHeight(44, 148);
+
+  // Merge and style Instructions cards.
+  ['B2:I2', 'B3:I3', 'B4:I4', 'B6:I6', 'B10:I10', 'B19:I19', 'B26:I26', 'B35:I35', 'B42:I42'].forEach(function(a1) {
+    instSheet.getRange(a1).merge();
+  });
+  [7, 8, 27, 28, 29, 30, 31, 32, 33, 36, 37, 38, 39, 40].forEach(function(r) {
+    instSheet.getRange(r, 2, 1, 2).merge();
+    instSheet.getRange(r, 4, 1, 6).merge();
+  });
+  [11, 12, 13, 14, 15, 16, 17, 20, 21, 22, 23, 24].forEach(function(r) {
+    instSheet.getRange(r, 3, 1, 2).merge();
+    instSheet.getRange(r, 5, 1, 5).merge();
+  });
+  instSheet.getRange('D43:I43').merge();
+  instSheet.getRange('D44:I44').merge();
+
+  instSheet.getRange('B2:I4').setBackground('#ffffff');
+  instSheet.getRange('B2').setFontSize(16).setFontWeight('bold').setFontColor('#1a73e8');
+  instSheet.getRange('B3').setFontSize(10).setFontWeight('bold').setFontColor('#5f6368');
+  instSheet.getRange('B4:I4').setBackground('#f8f9fa').setFontSize(10).setFontColor('#3c4043').setWrap(true);
+  styleCardBox_(instSheet.getRange('B2:I4'), '#dadce0', '#1a73e8');
+
+  [
+    { hdr: 'B6:I6', box: 'B6:I8', tblHdr: null },
+    { hdr: 'B10:I10', box: 'B10:I17', tblHdr: 'B11:I11' },
+    { hdr: 'B19:I19', box: 'B19:I24', tblHdr: 'B20:I20' },
+    { hdr: 'B26:I26', box: 'B26:I33', tblHdr: 'B27:I27' },
+    { hdr: 'B35:I35', box: 'B35:I40', tblHdr: 'B36:I36' },
+    { hdr: 'B42:I42', box: 'B42:I44', tblHdr: 'B43:I43' }
+  ].forEach(function(sec) {
+    instSheet.getRange(sec.box).setBackground('#ffffff').setWrap(true);
+    instSheet.getRange(sec.box).setBorder(true, true, true, true, true, true, '#dadce0', SpreadsheetApp.BorderStyle.SOLID);
+    instSheet.getRange(sec.hdr).setBackground('#ffffff').setFontColor('#1a73e8').setFontSize(12).setFontWeight('bold');
+    if (sec.tblHdr) {
+      instSheet.getRange(sec.tblHdr).setBackground('#1a73e8').setFontColor('#ffffff').setFontWeight('bold');
+    }
+  });
+  instSheet.getRange('B7:C8').setFontWeight('bold');
+  instSheet.getRange('B12:B17').setFontWeight('bold').setHorizontalAlignment('center');
+  instSheet.getRange('B21:B24').setFontWeight('bold').setHorizontalAlignment('center');
+  instSheet.getRange('B28:C33').setFontWeight('bold');
+  instSheet.getRange('B37:C40').setFontWeight('bold');
+  instSheet.getRange('B44:C44').setFontWeight('bold').setHorizontalAlignment('center').setVerticalAlignment('top');
+  instSheet.getRange('D44:I44').setVerticalAlignment('top');
+
+  // 3. Build the Overview tab.
+  let overview = ss.getSheetByName('Overview') || ss.insertSheet('Overview');
+  ensureSheetGridSize_(overview, 76, 10);
+  overview.setTabColor('#1a73e8');
+  overview.setHiddenGridlines(true);
+
+  const ovColWidths = [26, 185, 185, 48, 185, 185, 48, 185, 185, 26];
+  for (let c = 0; c < ovColWidths.length; c++) {
+    overview.setColumnWidth(c + 1, ovColWidths[c]);
+  }
+
+  overview.getRange('A1:J76')
+    .setBackground('#f1f3f4')
+    .setFontColor('#202124')
+    .setFontFamily('Google Sans')
+    .setFontSize(10)
+    .setVerticalAlignment('middle');
+
+  const todayIso = Utilities.formatDate(new Date(), ss.getSpreadsheetTimeZone() || 'UTC', 'yyyy-MM-dd');
+  const ovValues = [];
+  for (let r = 0; r < 76; r++) {
+    ovValues.push(['', '', '', '', '', '', '', '', '', '']);
+  }
+
+  ovValues[1][1] = 'Google Ad Manager Unified Report';
+  ovValues[3][1] =
+    'Author: Francesco Fresta - fresta@google.com\n\n' +
+    'Copyright Google LLC. Supported by Google LLC and/or its affiliate(s). This solution, including any related sample code or data, is made available on an “as is,” “as available,” and “with all faults” basis, solely for illustrative purposes, and without warranty or representation of any kind. This solution is experimental, unsupported and provided solely for your convenience. Your use of it is subject to your agreements with Google, as applicable, and may constitute a beta feature as defined under those agreements. To the extent that you make any data available to Google in connection with your use of the solution, you represent and warrant that you have all necessary and appropriate rights, consents and permissions to permit Google to use and process that data. By using any portion of this solution, you acknowledge, assume and accept all risks, known and unknown, associated with its usage and any processing of data by Google, including with respect to your deployment of any portion of this solution in your systems, or usage in connection with your business, if at all. In connection with this solution, you will not provide to Google any personally identifiable information, personal information or personal data.';
+
+  ovValues[5][1] = '▎ Report Parameters';
+  ovValues[5][7] = '=IF(C12<>"ALL", "Filtered dataset records (Ad Unit: "&C12&"): "&TEXT(COUNTIF(Ad_Unit_Data!C2:C, C12), "#,##0"), IF(F12<>"ALL", "Filtered dataset records (Country: "&F12&"): "&TEXT(COUNTIF(Country_Data!C2:C, F12), "#,##0"), "Filtered dataset records (All Ad Units): "&TEXT(COUNTA(Ad_Unit_Data!A2:A), "#,##0")))';
+
+  ovValues[6][1] = 'Network Code';
+  ovValues[6][2] = '<INSERT_HERE>';
+  ovValues[6][4] = 'Start Date (YYYY-MM-DD)';
+  ovValues[6][5] = todayIso;
+  ovValues[6][7] = 'GCP Project ID (Quota)';
+  ovValues[6][8] = '<INSERT_HERE>';
+
+  ovValues[7][4] = 'End Date (YYYY-MM-DD)';
+  ovValues[7][5] = todayIso;
+
+  ovValues[9][1] = '⚡ Generate Report';
+  ovValues[9][4] = '🔄 Reset Filters';
+  ovValues[9][5] = '🧹 Clear Data';
+  ovValues[9][7] = '📥 Download CSV';
+
+  ovValues[10][1] = '📱 Filter by Ad Unit (Select below)';
+  ovValues[10][4] = '🌍 Filter by Country (Select below)';
+  ovValues[10][7] = '📊 Total Filtered Impressions';
+
+  ovValues[11][1] = 'Ad Unit Filter:';
+  ovValues[11][2] = 'ALL';
+  ovValues[11][4] = 'Country Filter:';
+  ovValues[11][5] = 'ALL';
+  ovValues[11][7] = '=IF(C12<>"ALL", SUMIF(Ad_Unit_Data!C2:C, C12, Ad_Unit_Data!I2:I), IF(F12<>"ALL", SUMIF(Country_Data!C2:C, F12, Country_Data!I2:I), SUM(Ad_Unit_Data!I2:I)))';
+
+  ovValues[13][1] = 'AD EXCHANGE REVENUE';
+  ovValues[13][3] = '+';
+  ovValues[13][4] = 'OPMC REVENUE';
+  ovValues[13][6] = '="="';
+  ovValues[13][7] = 'TOTAL REVENUE';
+
+  ovValues[14][1] = '=IF(C12<>"ALL", SUMIF(Ad_Unit_Data!C2:C, C12, Ad_Unit_Data!D2:D), IF(F12<>"ALL", SUMIF(Country_Data!C2:C, F12, Country_Data!D2:D), SUM(Ad_Unit_Data!D2:D)))';
+  ovValues[14][4] = '=IF(C12<>"ALL", SUMIF(Ad_Unit_Data!C2:C, C12, Ad_Unit_Data!E2:E), IF(F12<>"ALL", SUMIF(Country_Data!C2:C, F12, Country_Data!E2:E), SUM(Ad_Unit_Data!E2:E)))';
+  ovValues[14][7] = '=B15+E15';
+
+  ovValues[15][1] = '="Historical Report ("&Chart_Helper!M2&") • Demand Channel: Ad Exchange (Parent Total)"';
+  ovValues[15][4] = '="On-platform multicall Report ("&Chart_Helper!M2&") • Mediation (Yield Partner: AdMob)"';
+  ovValues[15][7] = '="AdX Share: "&TEXT(IF(H15>0, B15/H15, 0), "0.0%")&"  |  OPMC Share: "&TEXT(IF(H15>0, E15/H15, 0), "0.0%")';
+
+  ovValues[17][1] = '▎ Daily Revenue Trends';
+  ovValues[17][7] = '="Active Filter: "&IF(C12<>"ALL", "Ad Unit = "&C12, IF(F12<>"ALL", "Country = "&F12, "All Inventory & Countries"))';
+
+  ovValues[36][1] = '▎ Stacked Incremental Revenue';
+  ovValues[36][7] = 'Ad Exchange Base + Incremental OPMC Uplift (Stacked)';
+
+  ovValues[55][1] = '▎ Country Revenue Breakdown (Top 10 Countries)';
+  ovValues[55][7] = 'Ad Exchange + OPMC Revenue Stacked by Country';
+
+  // Format plain-text ID inputs before setting values so IDs never convert to scientific notation.
+  overview.getRange('C7:C8').setNumberFormat('@');
+  overview.getRange('I7:I8').setNumberFormat('@');
+  overview.getRange(1, 1, ovValues.length, 10).setValues(ovValues);
+  overview.getRange('F7:F8').setNumberFormat('yyyy-mm-dd');
+
+  // Set exact Overview row heights.
+  overview.setRowHeight(1, 16);
+  overview.setRowHeights(2, 2, 26);
+  overview.setRowHeight(4, 82);
+  overview.setRowHeight(5, 16);
+  overview.setRowHeight(6, 32);
+  overview.setRowHeights(7, 2, 34);
+  overview.setRowHeight(9, 14);
+  overview.setRowHeight(10, 44);
+  overview.setRowHeight(11, 26);
+  overview.setRowHeight(12, 34);
+  overview.setRowHeight(13, 18);
+  overview.setRowHeight(14, 28);
+  overview.setRowHeight(15, 52);
+  overview.setRowHeight(16, 28);
+  overview.setRowHeight(17, 18);
+  overview.setRowHeight(18, 34);
+  overview.setRowHeights(19, 17, 22);
+  overview.setRowHeight(36, 18);
+  overview.setRowHeight(37, 34);
+  overview.setRowHeights(38, 17, 22);
+  overview.setRowHeight(55, 18);
+  overview.setRowHeight(56, 34);
+  overview.setRowHeights(57, 17, 22);
+  overview.setRowHeights(74, 3, 18);
+
+  // Merge Overview ranges.
+  [
+    'B2:I3', 'B4:I4',
+    'B6:G6', 'H6:I6',
+    'B7:B8', 'C7:C8', 'H7:H8', 'I7:I8',
+    'B10:C10', 'H10:I10',
+    'B11:C11', 'E11:F11', 'H11:I11', 'H12:I12',
+    'B14:C14', 'B15:C15', 'B16:C16', 'D14:D16',
+    'E14:F14', 'E15:F15', 'E16:F16', 'G14:G16',
+    'H14:I14', 'H15:I15', 'H16:I16',
+    'B18:G18', 'H18:I18',
+    'B37:G37', 'H37:I37',
+    'B56:G56', 'H56:I56'
+  ].forEach(function(a1) {
+    overview.getRange(a1).merge();
+  });
+
+  // Style Header Card (B2:I4).
+  overview.getRange('B2:I3').setBackground('#ffffff').setFontColor('#202124').setFontSize(16).setFontWeight('bold');
+  overview.getRange('B4:I4').setBackground('#f8f9fa').setFontColor('#5f6368').setFontSize(9).setWrap(true);
+  styleCardBox_(overview.getRange('B2:I4'), '#dadce0', '#1a73e8');
+
+  // Style Report Parameters Card (B6:I8).
+  overview.getRange('B6:I8').setBackground('#ffffff');
+  styleCardBox_(overview.getRange('B6:I8'), '#dadce0');
+  overview.getRange('B6:G6').setFontColor('#1a73e8').setFontSize(12).setFontWeight('bold');
+  overview.getRange('H6:I6').setBackground('#e8f0fe').setFontColor('#1967d2').setFontSize(9).setFontWeight('bold').setHorizontalAlignment('center');
+
+  ['B7:B8', 'E7:E8', 'H7:H8'].forEach(function(lblRange) {
+    overview.getRange(lblRange).setFontColor('#5f6368').setFontSize(9).setFontWeight('bold').setHorizontalAlignment('right');
+  });
+  ['C7:C8', 'F7', 'F8', 'I7:I8'].forEach(function(inpRange) {
+    const r = overview.getRange(inpRange);
+    r.setBackground('#f8f9fa').setFontColor('#202124').setFontSize(10).setFontWeight('bold').setHorizontalAlignment('left');
+    r.setBorder(true, true, true, true, false, false, '#dadce0', SpreadsheetApp.BorderStyle.SOLID);
+  });
+
+  // Style Row 10 Action Buttons.
+  overview.getRange('B10:C10')
+    .setBackground('#1a73e8')
+    .setFontColor('#ffffff')
+    .setFontSize(11)
+    .setFontWeight('bold')
+    .setHorizontalAlignment('center')
+    .setBorder(true, true, true, true, false, false, '#0d47a1', SpreadsheetApp.BorderStyle.SOLID_MEDIUM);
+  overview.getRange('E10')
+    .setBackground('#ffffff')
+    .setFontColor('#1a73e8')
+    .setFontSize(10)
+    .setFontWeight('bold')
+    .setHorizontalAlignment('center')
+    .setBorder(true, true, true, true, false, false, '#dadce0', SpreadsheetApp.BorderStyle.SOLID_MEDIUM);
+  overview.getRange('F10')
+    .setBackground('#ffffff')
+    .setFontColor('#d93025')
+    .setFontSize(10)
+    .setFontWeight('bold')
+    .setHorizontalAlignment('center')
+    .setBorder(true, true, true, true, false, false, '#dadce0', SpreadsheetApp.BorderStyle.SOLID_MEDIUM);
+  overview.getRange('H10:I10')
+    .setBackground('#137333')
+    .setFontColor('#ffffff')
+    .setFontSize(11)
+    .setFontWeight('bold')
+    .setHorizontalAlignment('center')
+    .setBorder(true, true, true, true, false, false, '#0b5323', SpreadsheetApp.BorderStyle.SOLID_MEDIUM);
+
+  // Style Filters Card (B11:I12).
+  overview.getRange('B11:I12').setBackground('#ffffff');
+  styleCardBox_(overview.getRange('B11:I12'), '#dadce0');
+  overview.getRange('B11:F11').setFontColor('#5f6368').setFontSize(9).setFontWeight('bold');
+  overview.getRange('H11:I11').setFontColor('#5f6368').setFontSize(9).setFontWeight('bold').setHorizontalAlignment('center');
+  overview.getRange('B12').setFontColor('#5f6368').setFontSize(9).setFontWeight('bold').setHorizontalAlignment('right');
+  overview.getRange('C12')
+    .setBackground('#e8f0fe')
+    .setFontColor('#1967d2')
+    .setFontSize(10)
+    .setFontWeight('bold')
+    .setBorder(true, true, true, true, false, false, '#1a73e8', SpreadsheetApp.BorderStyle.SOLID);
+  overview.getRange('E12').setFontColor('#5f6368').setFontSize(9).setFontWeight('bold').setHorizontalAlignment('right');
+  overview.getRange('F12')
+    .setBackground('#fef7e0')
+    .setFontColor('#b06000')
+    .setFontSize(10)
+    .setFontWeight('bold')
+    .setBorder(true, true, true, true, false, false, '#f29900', SpreadsheetApp.BorderStyle.SOLID);
+  overview.getRange('H12:I12')
+    .setBackground('#f8f9fa')
+    .setFontColor('#202124')
+    .setFontSize(12)
+    .setFontWeight('bold')
+    .setHorizontalAlignment('center')
+    .setNumberFormat('#,##0');
+
+  // Style Executive Scorecards Row (B14:I16).
+  overview.getRange('B14:C16').setBackground('#ffffff');
+  overview.getRange('B14:C14').setFontColor('#5f6368').setFontSize(10).setFontWeight('bold');
+  overview.getRange('B15:C15').setFontColor('#202124').setFontSize(22).setFontWeight('bold').setNumberFormat('$#,##0.00');
+  overview.getRange('B16:C16').setFontColor('#5f6368').setFontSize(8);
+  styleCardBox_(overview.getRange('B14:C16'), '#dadce0', '#1a73e8');
+
+  overview.getRange('D14:D16').setBackground('#f1f3f4').setFontColor('#9aa0a6').setFontSize(20).setFontWeight('bold').setHorizontalAlignment('center');
+
+  overview.getRange('E14:F16').setBackground('#ffffff');
+  overview.getRange('E14:F14').setFontColor('#5f6368').setFontSize(10).setFontWeight('bold');
+  overview.getRange('E15:F15').setFontColor('#202124').setFontSize(22).setFontWeight('bold').setNumberFormat('$#,##0.00');
+  overview.getRange('E16:F16').setFontColor('#5f6368').setFontSize(8);
+  styleCardBox_(overview.getRange('E14:F16'), '#dadce0', '#f29900');
+
+  overview.getRange('G14:G16').setBackground('#f1f3f4').setFontColor('#9aa0a6').setFontSize(20).setFontWeight('bold').setHorizontalAlignment('center');
+
+  overview.getRange('H14:I16').setBackground('#fafffa');
+  overview.getRange('H14:I14').setFontColor('#5f6368').setFontSize(10).setFontWeight('bold');
+  overview.getRange('H15:I15').setFontColor('#0f9d58').setFontSize(22).setFontWeight('bold').setNumberFormat('$#,##0.00');
+  overview.getRange('H16:I16').setFontColor('#137333').setFontSize(8).setFontWeight('bold');
+  styleCardBox_(overview.getRange('H14:I16'), '#ceead6', '#0f9d58');
+
+  // Style the 3 Chart Containers.
+  [
+    { box: 'B18:I35', title: 'B18:G18', sub: 'H18:I18', color: '#1a73e8' },
+    { box: 'B37:I54', title: 'B37:G37', sub: 'H37:I37', color: '#0f9d58' },
+    { box: 'B56:I73', title: 'B56:G56', sub: 'H56:I56', color: '#f29900' }
+  ].forEach(function(ch) {
+    overview.getRange(ch.box).setBackground('#ffffff');
+    styleCardBox_(overview.getRange(ch.box), '#dadce0');
+    overview.getRange(ch.title).setFontColor(ch.color).setFontSize(12).setFontWeight('bold');
+  });
+  overview.getRange('H18:I18').setFontColor('#5f6368').setFontSize(9).setFontWeight('bold').setHorizontalAlignment('right');
+  overview.getRange('H37:I37').setFontColor('#5f6368').setFontSize(9).setFontWeight('bold').setHorizontalAlignment('right');
+  overview.getRange('H56:I56').setFontColor('#5f6368').setFontSize(9).setFontWeight('bold').setHorizontalAlignment('right');
+
+  // Apply Data Validations on Overview (Calendar pickers on F7:F8 and dynamic dropdowns on C12 & F12).
+  const dateRule = SpreadsheetApp.newDataValidation()
+    .requireDate()
+    .setAllowInvalid(true)
+    .build();
+  overview.getRange('F7:F8').setDataValidation(dateRule);
+
+  const unitRule = SpreadsheetApp.newDataValidation()
+    .requireValueInRange(helperSheet.getRange('K2:K500'), true)
+    .setAllowInvalid(true)
+    .build();
+  overview.getRange('C12').setDataValidation(unitRule);
+
+  const countryRule = SpreadsheetApp.newDataValidation()
+    .requireValueInRange(helperSheet.getRange('L2:L300'), true)
+    .setAllowInvalid(true)
+    .build();
+  overview.getRange('F12').setDataValidation(countryRule);
+
+  // Add the 3 Embedded Charts on Overview if not already present.
+  if (overview.getCharts().length === 0) {
+    const chart1 = overview.newChart()
+      .asLineChart()
+      .addRange(helperSheet.getRange('A1:D100'))
+      .setNumHeaders(1)
+      .setPosition(19, 2, 8, 4)
+      .setOption('title', 'Daily Revenue Trends')
+      .setOption('width', 1190)
+      .setOption('height', 355)
+      .setOption('legend', { position: 'top', textStyle: { fontName: 'Roboto', fontSize: 11 } })
+      .setOption('curveType', 'function')
+      .setOption('hAxis', { title: 'Date', textStyle: { fontName: 'Roboto', fontSize: 10 } })
+      .setOption('vAxis', { title: 'Revenue', textStyle: { fontName: 'Roboto', fontSize: 10 } })
+      .setOption('colors', ['#0f9d58', '#1a73e8', '#f29900'])
+      .setOption('series', {
+        0: { lineWidth: 3, color: '#0f9d58' },
+        1: { lineWidth: 3, color: '#1a73e8' },
+        2: { lineWidth: 3, lineDashStyle: [6, 3], color: '#f29900' }
+      })
+      .setOption('useFirstColumnAsDomain', true)
+      .build();
+    overview.insertChart(chart1);
+
+    const chart2 = overview.newChart()
+      .asColumnChart()
+      .setStacked()
+      .addRange(helperSheet.getRange('A1:A100'))
+      .addRange(helperSheet.getRange('C1:D100'))
+      .setNumHeaders(1)
+      .setPosition(38, 2, 8, 4)
+      .setOption('width', 1190)
+      .setOption('height', 355)
+      .setOption('legend', { position: 'top', textStyle: { fontName: 'Roboto', fontSize: 11 } })
+      .setOption('hAxis', { title: 'Date', textStyle: { fontName: 'Roboto', fontSize: 10 } })
+      .setOption('vAxis', { title: 'Combined Revenue (AdX + OPMC)', textStyle: { fontName: 'Roboto', fontSize: 10 } })
+      .setOption('colors', ['#1a73e8', '#f29900'])
+      .setOption('useFirstColumnAsDomain', true)
+      .build();
+    overview.insertChart(chart2);
+
+    const chart3 = overview.newChart()
+      .asColumnChart()
+      .setStacked()
+      .addRange(helperSheet.getRange('F1:H11'))
+      .setNumHeaders(1)
+      .setPosition(57, 2, 8, 4)
+      .setOption('width', 1190)
+      .setOption('height', 355)
+      .setOption('legend', { position: 'top', textStyle: { fontName: 'Roboto', fontSize: 11 } })
+      .setOption('hAxis', { title: 'Country', textStyle: { fontName: 'Roboto', fontSize: 10 } })
+      .setOption('vAxis', { title: 'Revenue', textStyle: { fontName: 'Roboto', fontSize: 10 } })
+      .setOption('colors', ['#1a73e8', '#f29900'])
+      .setOption('useFirstColumnAsDomain', true)
+      .build();
+    overview.insertChart(chart3);
+  }
+
+  // 4. Build and style the Ad Unit Breakdown tab.
+  let breakdown = ss.getSheetByName('Ad Unit Breakdown') || ss.insertSheet('Ad Unit Breakdown');
+  ensureSheetGridSize_(breakdown, 60, 10);
+  breakdown.setTabColor('#0f9d58');
+  breakdown.setHiddenGridlines(true);
+
+  const bdColWidths = [26, 340, 360, 290, 165, 165, 130, 130, 165, 26];
+  for (let c = 0; c < bdColWidths.length; c++) {
+    breakdown.setColumnWidth(c + 1, bdColWidths[c]);
+  }
+  breakdown.getRange('A1:J60')
+    .setBackground('#f1f3f4')
+    .setFontColor('#202124')
+    .setFontFamily('Google Sans')
+    .setFontSize(10)
+    .setVerticalAlignment('middle');
+
+  breakdown.setRowHeight(1, 16);
+  breakdown.setRowHeights(2, 2, 24);
+  breakdown.setRowHeight(4, 46);
+  breakdown.setRowHeight(5, 16);
+  breakdown.setRowHeight(6, 26);
+  breakdown.setRowHeight(7, 44);
+  breakdown.setRowHeight(8, 26);
+  breakdown.setRowHeight(9, 16);
+  breakdown.setRowHeight(10, 32);
+
+  [
+    'B2:I3', 'B4:I4',
+    'B6:C6', 'D6:E6', 'F6:G6', 'H6:I6',
+    'B7:C7', 'D7:E7', 'F7:G7', 'H7:I7',
+    'B8:C8', 'D8:E8', 'F8:G8', 'H8:I8',
+    'B10:G10', 'H10:I10'
+  ].forEach(function(a1) {
+    breakdown.getRange(a1).merge();
+  });
+
+  breakdown.getRange('B2:I3').setBackground('#ffffff').setFontColor('#202124').setFontSize(16).setFontWeight('bold');
+  breakdown.getRange('B4:I4').setBackground('#f8f9fa').setFontColor('#5f6368').setFontSize(9).setWrap(true);
+  styleCardBox_(breakdown.getRange('B2:I4'), '#dadce0', '#0f9d58');
+
+  [
+    { box: 'B6:C8', lbl: 'B6:C6', val: 'B7:C7', sub: 'B8:C8', accent: '#5f6368', valSize: 13, valColor: '#202124', bg: '#ffffff' },
+    { box: 'D6:E8', lbl: 'D6:E6', val: 'D7:E7', sub: 'D8:E8', accent: '#1a73e8', valSize: 18, valColor: '#202124', bg: '#ffffff', curr: true },
+    { box: 'F6:G8', lbl: 'F6:G6', val: 'F7:G7', sub: 'F8:G8', accent: '#f29900', valSize: 18, valColor: '#202124', bg: '#ffffff', curr: true },
+    { box: 'H6:I8', lbl: 'H6:I6', val: 'H7:I7', sub: 'H8:I8', accent: '#0f9d58', valSize: 18, valColor: '#0f9d58', bg: '#fafffa', curr: true }
+  ].forEach(function(kpi) {
+    breakdown.getRange(kpi.box).setBackground(kpi.bg);
+    breakdown.getRange(kpi.lbl).setFontColor('#5f6368').setFontSize(9).setFontWeight('bold');
+    breakdown.getRange(kpi.val).setFontColor(kpi.valColor).setFontSize(kpi.valSize).setFontWeight('bold');
+    if (kpi.curr) {
+      breakdown.getRange(kpi.val).setNumberFormat('$#,##0.00');
+    }
+    breakdown.getRange(kpi.sub).setFontColor(kpi.accent === '#0f9d58' ? '#137333' : '#5f6368').setFontSize(8).setFontWeight(kpi.accent === '#0f9d58' ? 'bold' : 'normal');
+    styleCardBox_(breakdown.getRange(kpi.box), kpi.accent === '#0f9d58' ? '#ceead6' : '#dadce0', kpi.accent);
+  });
+
+  breakdown.getRange('B10:G10').setBackground('#ffffff').setFontColor('#1a73e8').setFontSize(12).setFontWeight('bold');
+  breakdown.getRange('H10:I10').setBackground('#e8f0fe').setFontColor('#1967d2').setFontSize(9).setFontWeight('bold').setHorizontalAlignment('center');
+
+  writeParentAdUnitBreakdownSheet_(ss, {
+    ad_unit_rows: [],
+    currency_code: 'USD',
+    currency_symbol: '$'
+  });
+
+  // 5. Remove any leftover empty default sheet (e.g., Sheet1) and order tabs cleanly.
+  const managedNames = {
+    Instructions: true,
+    Overview: true,
+    'Ad Unit Breakdown': true,
+    Ad_Unit_Data: true,
+    Country_Data: true,
+    Daily_Data: true,
+    Chart_Helper: true
+  };
+  ss.getSheets().forEach(function(s) {
+    const nm = s.getName();
+    if (!managedNames[nm] && s.getLastRow() === 0 && s.getLastColumn() === 0 && s.getCharts().length === 0) {
+      try {
+        ss.deleteSheet(s);
+      } catch (e) {}
+    }
+  });
+
+  const desiredOrder = [
+    instSheet,
+    overview,
+    breakdown,
+    unitSheet,
+    countrySheet,
+    dailySheet,
+    helperSheet
+  ];
+  desiredOrder.forEach(function(s, idx) {
+    if (s) {
+      try {
+        ss.setActiveSheet(s);
+        ss.moveActiveSheet(idx + 1);
+      } catch (e) {}
+    }
+  });
+
+  [unitSheet, countrySheet, dailySheet, helperSheet].forEach(function(s) {
+    if (s) {
+      try {
+        s.hideSheet();
+      } catch (e) {}
+    }
+  });
+
+  ss.setActiveSheet(overview);
+  SpreadsheetApp.flush();
 }
 
 /**
@@ -136,6 +915,14 @@ function installDashboardButtons_() {
   if (!ss) return;
   const sheet = ss.getSheetByName('Overview') || ss.getSheetByName('Dashboard');
   if (!sheet) return;
+
+  try {
+    const g14 = sheet.getRange('G14');
+    if (String(g14.getDisplayValue() || '').indexOf('#ERROR') === 0) {
+      sheet.getRange('G14:G16').setNumberFormat('General');
+      g14.setFormula('="="');
+    }
+  } catch (e) {}
 
   const defs = [
     { key: 'generate_report', col: 2, row: 10, width: 345, height: 44, fn: 'runReportFromSheetParams', desc: 'Generate Report' },
@@ -259,12 +1046,14 @@ function clearReportData() {
   // 4. Reset the hidden Chart_Helper tab.
   const helperSheet = ss.getSheetByName('Chart_Helper');
   if (helperSheet) {
-    // Clear daily helper rows in columns A to D.
+    // Clear daily helper rows in columns A to D and seed row 2 with 0s so chart series stay bound.
     helperSheet.getRange(2, 1, 150, 4).clearContent();
+    helperSheet.getRange('A2:D2').setValues([['—', 0, 0, 0]]);
 
-    // Reset the top 10 countries table in columns F to I.
+    // Reset the top 10 countries table in columns F to I and seed row 2 with 0s.
     helperSheet.getRange('F1:I1').setValues([['Country', 'Ad Exchange Revenue', 'On-platform multicall Revenue', 'Total Revenue']]);
     helperSheet.getRange(2, 6, 15, 4).clearContent();
+    helperSheet.getRange('F2:I2').setValues([['—', 0, 0, 0]]);
 
     // Reset filter dropdown lists in columns K and L to "ALL".
     helperSheet.getRange(1, 11, Math.max(helperSheet.getLastRow(), 150), 1).clearContent();
@@ -286,11 +1075,16 @@ function clearReportData() {
     });
   } catch (err) {}
 
-  // 6. Reset the filter cells on the Overview tab to "ALL".
+  // 6. Reset the filter cells and scorecard currency format on the Overview tab.
   const dash = getTargetDashboardSheet_(ss);
   if (dash) {
     dash.getRange('C12').setValue('ALL');
     dash.getRange('F12').setValue('ALL');
+    try {
+      dash.getRange('B15').setNumberFormat('$#,##0.00');
+      dash.getRange('E15').setNumberFormat('$#,##0.00');
+      dash.getRange('H15').setNumberFormat('$#,##0.00');
+    } catch (e) {}
   }
 
   // 7. Hide the data and helper tabs.
@@ -341,15 +1135,22 @@ function onSelectionChange(e) {
       sheet.getRange('F12').setValue('ALL');
       sheet.getRange('C12').activate();
       SpreadsheetApp.flush();
-    } else if (cellText.indexOf('Clear') !== -1) {
-      sheet.getRange('C12').activate();
-      clearReportData();
-    } else if (cellText.indexOf('Download') !== -1) {
-      sheet.getRange('C12').activate();
-      downloadCsvFromSheet();
-    } else if (cellText.indexOf('Generate Report') !== -1) {
+    } else if (
+      cellText.indexOf('Clear') !== -1 ||
+      cellText.indexOf('Download') !== -1 ||
+      cellText.indexOf('Generate Report') !== -1
+    ) {
+      // Simple triggers run in AuthMode.LIMITED and cannot call ScriptApp.getOAuthToken() or UI modals.
+      // If clicking row 10 selected the underlying cell instead of the floating button, prompt a one-time refresh.
       sheet.getRange('C7').activate();
-      runReportFromSheetParams();
+      const ss = e.source || SpreadsheetApp.getActiveSpreadsheet();
+      if (ss) {
+        ss.toast(
+          'Please refresh this Google Sheet tab once (Cmd+R or F5) to activate the row 10 action buttons.',
+          '🔄 Refresh Tab Once',
+          10
+        );
+      }
     }
   } catch (err) {}
 }
@@ -403,10 +1204,13 @@ function acquireValidGamToken_(explicitCustomToken) {
       return { token: scriptToken, source: 'ScriptApp.getOAuthToken()', scopes: checkScript.scopes };
     }
     throw new Error(
-      'OAUTH SCOPE MISSING (HTTP 403 ACCESS_TOKEN_SCOPE_INSUFFICIENT):\n' +
-        'Your Apps Script token currently has scopes: [' + (checkScript.scopes || 'none') + ']\n' +
-        'and is missing the required canonical scope "https://www.googleapis.com/auth/admanager".\n' +
-        'In the Apps Script Editor, open appsscript.json, ensure "https://www.googleapis.com/auth/admanager" is in "oauthScopes" (without dfp), Save, and click ▷ Run on authorizeAndVerifyGamScope.'
+      'MISSING appsscript.json MANIFEST (OAUTH SCOPE MISSING):\n' +
+        'Your workbook tabs were created, but Apps Script only has default scopes: [' + (checkScript.scopes || 'none') + ']\n' +
+        'and is missing "https://www.googleapis.com/auth/admanager".\n' +
+        'To fix this:\n' +
+        '1. Click Project Settings (gear icon on the left) and check Show "appsscript.json" manifest file in editor.\n' +
+        '2. Return to Editor (< >), open appsscript.json, paste the repository appsscript.json, and click Save.\n' +
+        '3. Click ▷ Run on authorizeAndVerifyGamScope again and approve the permission prompt.'
     );
   }
 
@@ -414,7 +1218,7 @@ function acquireValidGamToken_(explicitCustomToken) {
 }
 
 /**
- * Cleans the Google Cloud Project ID value from cell I8.
+ * Cleans the Google Cloud Project ID value from cell I7 (or legacy cell I8).
  * Removes spaces, strips any "projects/" prefix, and converts text to lowercase.
  */
 function normalizeQuotaProject_(val) {
@@ -426,11 +1230,18 @@ function normalizeQuotaProject_(val) {
 }
 
 /**
- * Checks whether a value is a valid Google Cloud Project ID and not a three-letter currency code.
+ * Checks whether a value is a valid Google Cloud Project ID and not a placeholder or three-letter currency code.
  */
 function isValidQuotaProject_(val) {
   const raw = String(val || '').trim();
-  if (!raw || /^[A-Z]{3}$/.test(raw) || CURRENCY_SYMBOLS[raw.toUpperCase()]) return false;
+  if (
+    !raw ||
+    raw.toUpperCase() === '<INSERT_HERE>' ||
+    /^[A-Z]{3}$/.test(raw) ||
+    CURRENCY_SYMBOLS[raw.toUpperCase()]
+  ) {
+    return false;
+  }
   const s = normalizeQuotaProject_(raw);
   if (!s || s.length < 4) return false;
   return /^[a-z0-9:._-]+$/.test(s);
@@ -638,7 +1449,7 @@ function onEdit(e) {
  * - C7: Network Code
  * - F7: Start Date (YYYY-MM-DD)
  * - F8: End Date (YYYY-MM-DD)
- * - I8: Google Cloud Project ID
+ * - I7 (or legacy I8): Google Cloud Project ID
  */
 function readParamsFromDashboardSheet_() {
   const defaults = {
@@ -658,24 +1469,42 @@ function readParamsFromDashboardSheet_() {
     const dash = getTargetDashboardSheet_(ss);
     if (!dash) return defaults;
 
-    const netCode = String(dash.getRange('C7').getDisplayValue() || '').trim();
-    const apiModeVal = String(dash.getRange('C8').getDisplayValue() || '').trim();
+    const rawNetCode = String(dash.getRange('C7').getDisplayValue() || '').trim();
+    const netCode = rawNetCode.toUpperCase() === '<INSERT_HERE>' ? '' : rawNetCode;
     const startVal = readDateCellIso_(dash.getRange('F7'), ss);
     const e8Label = String(dash.getRange('E8').getDisplayValue() || '').toUpperCase();
     const isStackedDatesLayout = e8Label.indexOf('END') !== -1;
+    const h7Label = String(dash.getRange('H7').getDisplayValue() || '').toUpperCase();
 
     const endVal = readDateCellIso_(dash.getRange(isStackedDatesLayout ? 'F8' : 'I7'), ss);
-    let i8Val = String(dash.getRange('I8').getDisplayValue() || '').trim();
-    if (!isValidQuotaProject_(i8Val)) {
+    let qpVal = String(dash.getRange('I8').getDisplayValue() || '').trim();
+    if (
+      !isValidQuotaProject_(qpVal) &&
+      isStackedDatesLayout &&
+      (h7Label.indexOf('PROJECT') !== -1 || h7Label.indexOf('QUOTA') !== -1)
+    ) {
+      qpVal = String(dash.getRange('I7').getDisplayValue() || '').trim();
+    }
+    if (!isValidQuotaProject_(qpVal)) {
       const overviewSheet = ss.getSheetByName('Overview');
       if (overviewSheet && overviewSheet.getSheetId() !== dash.getSheetId()) {
-        i8Val = String(overviewSheet.getRange('I8').getDisplayValue() || '').trim();
+        qpVal = String(overviewSheet.getRange('I8').getDisplayValue() || '').trim();
+        if (!isValidQuotaProject_(qpVal)) {
+          const ovE8 = String(overviewSheet.getRange('E8').getDisplayValue() || '').toUpperCase();
+          const ovH7 = String(overviewSheet.getRange('H7').getDisplayValue() || '').toUpperCase();
+          if (
+            ovE8.indexOf('END') !== -1 &&
+            (ovH7.indexOf('PROJECT') !== -1 || ovH7.indexOf('QUOTA') !== -1)
+          ) {
+            qpVal = String(overviewSheet.getRange('I7').getDisplayValue() || '').trim();
+          }
+        }
       }
     }
 
     const apiMode = 'PUBLIC';
 
-    const resolvedQuotaProject = isValidQuotaProject_(i8Val) ? normalizeQuotaProject_(i8Val) : '';
+    const resolvedQuotaProject = isValidQuotaProject_(qpVal) ? normalizeQuotaProject_(qpVal) : '';
 
     return {
       sheet_name: dash.getName(),
@@ -705,7 +1534,7 @@ function runReportFromSheetParams() {
     }
     if (!params.quota_project) {
       throw new Error(
-        'Missing GCP Project ID (Quota): Please enter your GCP Project ID in cell I8 on the Overview tab (and press Enter to commit the cell) before clicking Generate Report.'
+        'Missing GCP Project ID (Quota): Please enter your GCP Project ID in cell I7 on the Overview tab (and press Enter to commit the cell) before clicking Generate Report.'
       );
     }
     runUnifiedReportPipeline(params);
@@ -732,7 +1561,7 @@ function resolveApiConfig_(params) {
 
   if (!quotaProject) {
     throw new Error(
-      'Missing GCP Project ID (Quota): Please enter your GCP Project ID in cell I8 on the Overview tab (and press Enter to commit the cell) before running the report.'
+      'Missing GCP Project ID (Quota): Please enter your GCP Project ID in cell I7 on the Overview tab (and press Enter to commit the cell) before running the report.'
     );
   }
 
@@ -816,7 +1645,7 @@ function executeBatchRequests_(requests, apiConfig, retries) {
           throw new Error(
             'GAM API Quota Project Error (HTTP ' + code + ' on ' +
               currentRequests[i].url +
-              '):\nConfigured GCP Project ID (Overview!I8): ' +
+              '):\nConfigured GCP Project ID (Overview!I7): ' +
               configuredQuotaProject +
               '\nToken Scopes: [' +
               ((apiConfig && apiConfig.tokenScopes) || 'none') +
@@ -1314,17 +2143,109 @@ function writeParentAdUnitBreakdownSheet_(ss, data) {
   }
 
   sheet.clearContents();
+  ensureSheetGridSize_(sheet, Math.max(totalGridRows, 40), 10);
   sheet.getRange(1, 1, grid.length, 10).setValues(grid);
 
   try {
     const cSym = String(data.currency_symbol || '$').replace(/"/g, '');
     const currFmt = cSym === '$' ? '$#,##0.00' : '"' + cSym + '"#,##0.00';
+
+    // Update top KPI currency format for non-USD networks.
+    sheet.getRange('D7').setNumberFormat(currFmt);
+    sheet.getRange('F7').setNumberFormat(currFmt);
+    sheet.getRange('H7').setNumberFormat(currFmt);
+
+    // Reset dynamic table area below row 10 so resized reports leave zero stale borders or fills.
+    const resetRows = Math.max(sheet.getMaxRows() - 10, 1);
+    const dynamicArea = sheet.getRange(11, 1, resetRows, 10);
+    dynamicArea.breakApart();
+    dynamicArea
+      .setBackground('#f1f3f4')
+      .setFontColor('#202124')
+      .setFontFamily('Google Sans')
+      .setFontSize(10)
+      .setFontWeight('normal')
+      .setBorder(false, false, false, false, false, false);
+
+    // Style Table 1 header (row 11) and Grand Total row (row 12).
+    sheet.setRowHeight(t1HeaderRow, 32);
+    sheet
+      .getRange(t1HeaderRow, 2, 1, 8)
+      .setBackground('#1a73e8')
+      .setFontColor('#ffffff')
+      .setFontWeight('bold')
+      .setBorder(true, true, true, true, true, true, '#1557b0', SpreadsheetApp.BorderStyle.SOLID);
+    sheet.getRange(t1HeaderRow, 2, 1, 2).setHorizontalAlignment('left');
+    sheet.getRange(t1HeaderRow, 4, 1, 6).setHorizontalAlignment('right');
+
+    sheet.setRowHeight(t1TotalRow, 32);
+    sheet
+      .getRange(t1TotalRow, 2, 1, 8)
+      .setBackground('#e6f4ea')
+      .setFontColor('#137333')
+      .setFontWeight('bold')
+      .setBorder(true, true, true, true, true, true, '#ceead6', SpreadsheetApp.BorderStyle.SOLID);
+    sheet.getRange(t1TotalRow, 2, 1, 2).setHorizontalAlignment('left');
+    sheet.getRange(t1TotalRow, 4, 1, 6).setHorizontalAlignment('right');
+
+    const t1FormattedRows = numParents + 1;
+    sheet.getRange(t1TotalRow, 4, t1FormattedRows, 3).setNumberFormat(currFmt);
+    sheet.getRange(t1TotalRow, 7, t1FormattedRows, 2).setNumberFormat('0.0%');
+    sheet.getRange(t1TotalRow, 9, t1FormattedRows, 1).setNumberFormat('#,##0');
+
     if (numParents > 0) {
-      sheet.getRange(t1TotalRow, 4, numParents + 1, 3).setNumberFormat(currFmt);
-      sheet.getRange(t1TotalRow, 7, numParents + 1, 2).setNumberFormat('0.0%');
-      sheet.getRange(t1TotalRow, 9, numParents + 1, 1).setNumberFormat('#,##0');
+      sheet.setRowHeights(t1StartRow, numParents, 28);
+      const t1Body = sheet.getRange(t1StartRow, 2, numParents, 8);
+      t1Body
+        .setBackground('#ffffff')
+        .setBorder(true, true, true, true, true, true, '#dadce0', SpreadsheetApp.BorderStyle.SOLID);
+      sheet.getRange(t1StartRow, 2, numParents, 1).setFontWeight('bold').setHorizontalAlignment('left');
+      sheet.getRange(t1StartRow, 3, numParents, 1).setFontColor('#5f6368').setHorizontalAlignment('left');
+      sheet.getRange(t1StartRow, 4, numParents, 6).setHorizontalAlignment('right');
+      sheet.getRange(t1StartRow, 6, numParents, 1).setFontWeight('bold').setFontColor('#0f9d58');
     }
+
+    // Style Table 2 section banner and header row.
+    sheet.setRowHeight(t2SectionRow, 32);
+    const t2Banner = sheet.getRange(t2SectionRow, 2, 1, 8);
+    t2Banner.merge();
+    t2Banner
+      .setBackground('#ffffff')
+      .setFontColor('#1a73e8')
+      .setFontSize(12)
+      .setFontWeight('bold')
+      .setHorizontalAlignment('left')
+      .setBorder(true, true, true, true, false, false, '#dadce0', SpreadsheetApp.BorderStyle.SOLID);
+
+    sheet.setRowHeight(t2HeaderRow, 32);
+    sheet
+      .getRange(t2HeaderRow, 2, 1, 8)
+      .setBackground('#202124')
+      .setFontColor('#ffffff')
+      .setFontWeight('bold')
+      .setBorder(true, true, true, true, true, true, '#3c4043', SpreadsheetApp.BorderStyle.SOLID);
+    sheet.getRange(t2HeaderRow, 2, 1, 3).setHorizontalAlignment('left');
+    sheet.getRange(t2HeaderRow, 5, 1, 5).setHorizontalAlignment('right');
+
     if (detailRows.length > 0) {
+      sheet.setRowHeights(t2StartRow, detailRows.length, 26);
+      const t2Bgs = [];
+      const t2Weights = [];
+      for (let dIdx = 0; dIdx < detailRows.length; dIdx++) {
+        const isParentRow = detailRows[dIdx].role.indexOf('Parent') === 0;
+        const rowBg = isParentRow ? '#f8f9fa' : '#ffffff';
+        const rowWeight = isParentRow ? 'bold' : 'normal';
+        t2Bgs.push([rowBg, rowBg, '#e8f0fe', rowBg, rowBg, rowBg, rowBg, rowBg]);
+        t2Weights.push([rowWeight, rowWeight, 'bold', rowWeight, rowWeight, 'bold', rowWeight, rowWeight]);
+      }
+      const t2Body = sheet.getRange(t2StartRow, 2, detailRows.length, 8);
+      t2Body
+        .setBackgrounds(t2Bgs)
+        .setFontWeights(t2Weights)
+        .setBorder(true, true, true, true, true, true, '#dadce0', SpreadsheetApp.BorderStyle.SOLID);
+      sheet.getRange(t2StartRow, 2, detailRows.length, 3).setHorizontalAlignment('left');
+      sheet.getRange(t2StartRow, 4, detailRows.length, 1).setFontColor('#1967d2');
+      sheet.getRange(t2StartRow, 5, detailRows.length, 5).setHorizontalAlignment('right');
       sheet.getRange(t2StartRow, 5, detailRows.length, 3).setNumberFormat(currFmt);
       sheet.getRange(t2StartRow, 8, detailRows.length, 1).setNumberFormat('0.0%');
       sheet.getRange(t2StartRow, 9, detailRows.length, 1).setNumberFormat('#,##0');
@@ -1783,6 +2704,9 @@ function writeResultsToSheets_(data, params) {
     writeParentAdUnitBreakdownSheet_(ss, data);
   } catch (parentErr) {}
 
+  const cSym = String(data.currency_symbol || '$').replace(/"/g, '');
+  const currFmt = cSym === '$' ? '$#,##0.00' : '"' + cSym + '"#,##0.00';
+
   const dash = getTargetDashboardSheet_(ss);
   if (dash) {
     const e8Label = String(dash.getRange('E8').getDisplayValue() || '').toUpperCase();
@@ -1790,6 +2714,11 @@ function writeResultsToSheets_(data, params) {
     if (!isStackedDatesLayout) {
       dash.getRange('I8').setValue(data.currency_code || 'USD');
     }
+    try {
+      dash.getRange('B15').setNumberFormat(currFmt);
+      dash.getRange('E15').setNumberFormat(currFmt);
+      dash.getRange('H15').setNumberFormat(currFmt);
+    } catch (e) {}
   }
 
   // Update daily rows, top 10 countries, filter dropdown lists, and currency code in Chart_Helper.
@@ -1812,6 +2741,15 @@ function writeResultsToSheets_(data, params) {
           ]);
         }
         helperSheet.getRange(2, 1, numDaily, 4).setFormulas(helperDailyFormulas);
+        try {
+          helperSheet.getRange(2, 2, Math.max(numDaily, 100), 3).setNumberFormat(currFmt);
+        } catch (fmtErr) {}
+      } else {
+        const emptyLbl = (params && params.start_date && formatDateLabel_(params.start_date)) || '—';
+        helperSheet.getRange('A2:D2').setValues([[emptyLbl, 0, 0, 0]]);
+        try {
+          helperSheet.getRange(2, 2, 100, 3).setNumberFormat(currFmt);
+        } catch (fmtErr) {}
       }
 
       const cTotals = {};
@@ -1838,7 +2776,7 @@ function writeResultsToSheets_(data, params) {
       helperSheet.getRange(2, 6, 10, 1).setValues(countryNames);
       helperSheet.getRange(2, 7, 10, 3).setFormulas(countryFormulas);
       try {
-        helperSheet.getRange('G2:I11').setNumberFormat('$#,##0.00');
+        helperSheet.getRange('G2:I11').setNumberFormat(currFmt);
       } catch (fmtErr) {}
 
       const unitOpts = [['Ad_Unit_Options'], ['ALL']].concat((data.ad_units || []).map(function(u) { return [u]; }));
