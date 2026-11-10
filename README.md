@@ -1,36 +1,33 @@
 # Google Ad Manager Unified Report
 
-This Google Apps Script and Google Sheets solution combines your Ad Exchange revenue and your On-Platform Multicall (OPMC) revenue into one report. Use this workbook to view daily trends, compare country performance, and see total revenue for each ad unit.
-
-When you run the setup function in a blank Google Sheet, the script automatically builds all workbook tabs, formulas, interactive filters, action buttons, and charts for you.
+This Google Sheets and Apps Script tool combines your Ad Exchange revenue and On-Platform Multicall (OPMC) revenue into one report. Run the setup function once in a blank Google Sheet to create all tabs, formulas, filters, buttons, and charts.
 
 ---
 
 ## 1. Workbook Tabs
 
-* **Instructions**: Shows the one-time setup guide, report steps, button descriptions, and key revenue terms.
-* **Overview**: Runs reports, filters data by ad unit or country, shows total revenue cards, and displays daily, incremental, and country charts.
-* **Ad Unit Breakdown**: Shows revenue for each Parent Ad Unit (A) combined with its OPMC Child Ad Units (A1, A2, A3, A4).
+* **Overview**: Run reports, filter by ad unit or country, view revenue totals, and check daily revenue, daily eCPM, incremental uplift, and country charts.
+* **Ad Unit Breakdown**: See combined revenue for each Parent Ad Unit (A) and its OPMC Child Ad Units (A1 to A4).
+* **Instructions**: View the setup steps, button guide, and key revenue definitions inside your sheet.
 
 ---
 
-## 2. One-Time Setup: Google Cloud API and Apps Script
+## 2. One-Time Setup
 
 > [!IMPORTANT]
-> You must copy **both** [`appsscript.json`](appsscript.json) and [`Code.js`](Code.js) into your Apps Script project. Without `appsscript.json`, Google Apps Script cannot request Google Ad Manager API permission.
+> Copy **both** [`appsscript.json`](appsscript.json) and [`Code.js`](Code.js) into your Apps Script project. Without `appsscript.json`, Apps Script cannot get Google Ad Manager API access.
 
-Complete these seven steps one time to set up a new Google Sheet.
+### Step A: Set Up Google Cloud
 
-1. **Enable the Google Ad Manager API (`Google Cloud Console -> APIs & Services`)**:
-   Open your Google Cloud project and enable the [Google Ad Manager API](https://developers.google.com/ad-manager/api/beta) (`admanager.googleapis.com`).
-2. **Verify IAM Permission (`Google Cloud Console -> IAM & Admin -> IAM`)**:
-   Ensure your Google account has the **Service Usage Consumer** role (`roles/serviceusage.serviceUsageConsumer`) on that GCP project.
-3. **Copy your GCP Project ID (`Google Cloud Console -> Dashboard`)**:
-   Copy your GCP Project ID (or Project Number) from the **Project info** card on the Cloud Console Dashboard.
-4. **Open Apps Script in a new Google Sheet (`Google Sheets -> Extensions -> Apps Script`)**:
-   Create a blank Google Sheet ([sheets.new](https://sheets.new)). In the top menu, click **Extensions** and then click **Apps Script**.
-5. **Enable and paste `appsscript.json` (`Apps Script -> Project Settings -> Editor < >`)**:
-   Click **Project Settings** (the gear icon on the left) and check **Show "appsscript.json" manifest file in editor**. Return to **Editor** (`< >`), open `appsscript.json`, and replace its entire contents with [`appsscript.json`](appsscript.json):
+1. Open your Google Cloud project and enable the [Google Ad Manager API](https://developers.google.com/ad-manager/api/beta) (`admanager.googleapis.com`).
+2. Open `[IAM & Admin] > [IAM]` and make sure your Google account has the **Service Usage Consumer** role (`roles/serviceusage.serviceUsageConsumer`).
+3. Open `[Dashboard]` and copy your **GCP Project ID** (or Project Number) from the **Project info** card.
+
+### Step B: Set Up Your Google Sheet
+
+1. In a new browser tab, open [sheets.new](https://sheets.new) and click `[Extensions] > [Apps Script]`.
+2. Click `[Project Settings]` (gear icon) and check `[Show "appsscript.json" manifest file in editor]`.
+3. Click `[Editor]` (`< >`), open `appsscript.json`, and replace its contents with the JSON below:
    ```json
    {
      "timeZone": "America/Los_Angeles",
@@ -45,56 +42,40 @@ Complete these seven steps one time to set up a new Google Sheet.
      ]
    }
    ```
-6. **Paste `Code.js` and save (`Apps Script -> Editor < >`)**:
-   Open `Code.gs` in the editor, replace its entire contents with [`Code.js`](Code.js) from this repository, and click **Save project**.
-7. **Build the workbook and authorize OAuth (`Apps Script -> Editor < > -> Toolbar`)**:
-   Select `authorizeAndVerifyGamScope` in the top toolbar, click **Run**, and approve the permission prompt. The script automatically creates and formats all sheets, formulas, buttons, and charts. Return to your Google Sheet tab and refresh the browser page once (`Cmd+R` or `F5`) to activate the row 10 buttons.
+4. Open `Code.gs`, replace its contents with [`Code.js`](Code.js) from this repository, and click `[Save project]`.
+5. Select `authorizeAndVerifyGamScope` in the toolbar, click `[Run]`, and approve the permission prompt.
+6. Return to your Google Sheet tab and refresh the page once (`Cmd+R` or `F5`) to activate the buttons.
 
 ---
 
-## 3. How to Generate a Report (Step-by-Step)
+## 3. Run a Report
 
-1. **Open the Overview tab**:
-   Return to your Google Sheet and click the **Overview** tab at the bottom.
-2. **Enter Network Code and Project ID**:
-   Type your Google Ad Manager Network Code in cell **C7** and your GCP Project ID in cell **I7**, then press **Enter**.
-3. **Select your date range**:
-   Double-click cell **F7** to select the Start Date and double-click cell **F8** to select the End Date (`YYYY-MM-DD`).
-4. **Run the report**:
-   Click the blue **Generate Report** button in row 10. Wait for the **Report complete** message to appear.
+1. Open the **Overview** tab.
+2. Type your Google Ad Manager **Network Code** in cell `C7` and press **Enter**.
+3. Type your **GCP Project ID** in cell `I7` and press **Enter**.
+4. Double-click cell `F7` to pick the **Start Date** and cell `F8` to pick the **End Date** (`YYYY-MM-DD`).
+5. Click `[Generate Report]` (`B10:C10`) and wait for the **Report complete** message.
 
 ---
 
-## 4. Overview Tab Parameter Reference (`B7:I8`)
+## 4. Controls and Key Terms
 
-| Parameter Name | Label Cell | Input Cell | Description |
-| :--- | :--- | :--- | :--- |
-| **Network Code** | `B7` | `C7` | Your Google Ad Manager Network Code. |
-| **Start Date (YYYY-MM-DD)** | `E7` | `F7` | First date of the report. Double-click the cell to open the calendar picker. |
-| **End Date (YYYY-MM-DD)** | `E8` | `F8` | Last date of the report. Double-click the cell to open the calendar picker. |
-| **GCP Project ID (Quota)** | `H7` | `I7` | Your Google Cloud Project ID or Project Number where the Ad Manager API is enabled. |
-
----
-
-## 5. How to Use the Buttons and Filters in the Overview Tab
-
-| Button or Filter | Location | How to Use It |
+| Control | Cell | Action |
 | :--- | :--- | :--- |
-| **Generate Report** | `B10:C10` | Fetch new data from Google Ad Manager and update all charts and tables. |
-| **Reset Filters** | `E10` | Reset both the Ad Unit filter and the Country filter back to `ALL`. |
-| **Clear Data** | `F10` | Wipe all fetched report data from all sheets while preserving your settings and formulas. |
-| **Download CSV** | `H10:I10` | Download the full report as a CSV file. |
-| **Filter by Ad Unit** | `C12` | Select an ad unit from the dropdown list in cell `C12` to show revenue for that ad unit only. |
-| **Filter by Country** | `F12` | Select a country from the dropdown list in cell `F12` to show revenue for that country only. |
+| `[Generate Report]` | `B10:C10` | Fetch fresh data from Google Ad Manager and update all charts and tables. |
+| `[Reset Filters]` | `E10` | Reset both the Ad Unit filter and the Country filter to `ALL`. |
+| `[Clear Data]` | `F10` | Clear all report rows from the workbook while keeping your settings and formulas. |
+| `[Download CSV]` | `H10:I10` | Download the combined report as a CSV file. |
+| **Ad Unit Filter** | `C12` | Show revenue and impressions for one ad unit from the dropdown list. |
+| **Country Filter** | `F12` | Show revenue and impressions for one country from the dropdown list. |
 
----
-
-## 6. Key Revenue Terms
+### Key Revenue Terms
 
 * **Ad Exchange Revenue**: Revenue from standard Google Ad Exchange auctions on your ad units.
-* **OPMC Revenue**: Additional revenue from On-Platform Multicall (OPMC) mediation ad units.
-* **Total Revenue**: The sum of Ad Exchange Revenue plus OPMC Revenue.
-* **Parent Ad Unit Rollup**: On the **Ad Unit Breakdown** tab, Table 1 groups each Parent Ad Unit (A) with its OPMC Child Ad Units (A1 to A4). If you change a parent name in Table 2 (Column D), Table 1 updates automatically.
+* **OPMC Revenue**: Incremental revenue from On-Platform Multicall (OPMC) mediation ad units.
+* **Total Revenue**: The sum of Ad Exchange Revenue and OPMC Revenue.
+* **Daily eCPM**: Revenue per 1,000 impressions (`(Revenue / Impressions) * 1000`) for Total, Ad Exchange, and OPMC traffic.
+* **Parent Ad Unit Rollup**: Groups each Parent Ad Unit (A) with its OPMC Child Ad Units (A1 to A4) on **Ad Unit Breakdown**. Change any parent name in Table 2 (Column D) to update Table 1 automatically.
 
 ---
 
