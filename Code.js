@@ -15,10 +15,11 @@
  */
 
 /**
- * Google Ad Manager Unified Report
+ * Google Ad Manager Unified Report (v1.3)
  *
- * This script gets Ad Exchange and On-Platform Multicall (OPMC) report data
- * from the Google Ad Manager API and writes the combined results to Google Sheets.
+ * This script gets Primary Programmatic (Ad Exchange, Open Bidding, SDK Bidding)
+ * and On-Platform Multicall (OPMC) report data from the Google Ad Manager API
+ * and writes the combined results to Google Sheets.
  */
 
 // Base URLs and default project settings for the Google Ad Manager API.
@@ -71,17 +72,20 @@ const BUTTON_MARKER_PREFIX = 'gam-unified-btn:';
 const TRANSPARENT_1X1_PNG_BASE64 =
   'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVQI12NgAAIAAAUAAeImBZsAAAAASUVORK5CYII=';
 
-// Common ad format and placement words to ignore when matching parent and child ad units.
-const FORMAT_AND_NOISE_WORDS = {
+// Google-settled programmatic demand channels (excludes Mediation & Ad Server to avoid double-counting).
+const SETTLED_DEMAND_CHANNELS = ['AD_EXCHANGE', 'OPEN_BIDDING', 'SDK_BIDDING'];
+const DEMAND_CHANNEL_LABELS = {
+  AD_EXCHANGE: 'Ad Exchange',
+  OPEN_BIDDING: 'Open Bidding',
+  SDK_BIDDING: 'SDK Bidding'
+};
+const DEMAND_CHANNEL_OPTIONS = ['Ad Exchange', 'Open Bidding', 'SDK Bidding'];
+
+// Common noise, format, and platform words used to match parent and OPMC child ad units.
+const NOISE_WORDS = {
   opmc: true,
   multicall: true,
   waterfall: true,
-  native: true,
-  banner: true,
-  interstitial: true,
-  rewarded: true,
-  video: true,
-  appopen: true,
   placement: true,
   production: true,
   prod: true,
@@ -93,8 +97,63 @@ const FORMAT_AND_NOISE_WORDS = {
   multisize: true,
   img: true,
   no: true,
-  timer: true
+  timer: true,
+  final: true
 };
+
+const FORMAT_WORDS = {
+  native: true,
+  banner: true,
+  interstitial: true,
+  inter: true,
+  mrec: true,
+  rewarded: true,
+  video: true,
+  appopen: true
+};
+
+const PLATFORM_WORDS = {
+  a: true,
+  i: true,
+  w: true,
+  m: true,
+  d: true,
+  android: true,
+  ios: true,
+  web: true,
+  mobile: true,
+  desktop: true,
+  app: true
+};
+
+const ACTIVE_FILTER_FORMULA =
+  '="Active Filter: "&IF(C12<>"ALL", "Ad Unit = "&C12, IF(F12<>"ALL", "Country = "&F12, IF(AND(C8<>"", UPPER(C8)<>"ALL", C8<>"<INSERT_HERE>"), "Query = """&C8&"""", "All Inventory")))&IF(AND(I12<>"ALL", I12<>""), "  •  Channel = "&I12, "  •  Channels: AdX + OB + SDKB")';
+
+/**
+ * Maps a GAM DEMAND_CHANNEL enum or label to its canonical channel name.
+ */
+function normalizeDemandChannel_(rawChannel) {
+  const channelText = String(rawChannel || '').trim();
+  if (!channelText) return 'Ad Exchange';
+  const upperKey = channelText.toUpperCase().replace(/\s+/g, '_');
+  if (DEMAND_CHANNEL_LABELS[upperKey]) return DEMAND_CHANNEL_LABELS[upperKey];
+  const lowerText = channelText.toLowerCase();
+  if (lowerText.indexOf('open') !== -1 && lowerText.indexOf('bidding') !== -1) return 'Open Bidding';
+  if (lowerText.indexOf('sdk') !== -1 && lowerText.indexOf('bidding') !== -1) return 'SDK Bidding';
+  if (lowerText.indexOf('exchange') !== -1 || lowerText.indexOf('adx') !== -1) return 'Ad Exchange';
+  return channelText;
+}
+
+/**
+ * Escapes Google Sheets SUMIF/SUMIFS criteria wildcards and double quotes.
+ */
+function gsCriteriaLiteral_(rawText) {
+  return String(rawText || '')
+    .replace(/~/g, '~~')
+    .replace(/\*/g, '~*')
+    .replace(/\?/g, '~?')
+    .replace(/"/g, '""');
+}
 
 /**
  * Builds the workbook tabs (Overview, Instructions, Ad Unit Breakdown, and hidden data tabs),
@@ -191,107 +250,496 @@ function styleCardBox_(range, borderHex, topAccentHex, borderStyle) {
 }
 
 /**
- * Builds the Daily eCPM Trends line chart anchored on Overview at (anchorRow, 2).
+ * Inserts the 5 v1.3 embedded charts on Overview using explicit range and currency styling.
  */
-function buildDailyEcpmChart_(overview, helperSheet, anchorRow, numRows) {
-  const maxRow = Math.max(numRows || 400, 100);
-  return overview
-    .newChart()
-    .asLineChart()
-    .addRange(helperSheet.getRange('A1:A' + maxRow))
-    .addRange(helperSheet.getRange('Q1:S' + maxRow))
-    .setNumHeaders(1)
-    .setPosition(anchorRow || 38, 2, 8, 4)
-    .setOption('title', 'Daily eCPM Trends')
-    .setOption('width', 1190)
-    .setOption('height', 355)
-    .setOption('legend', { position: 'top', textStyle: { fontName: 'Roboto', fontSize: 11 } })
-    .setOption('curveType', 'function')
-    .setOption('hAxis', { title: 'Date', textStyle: { fontName: 'Roboto', fontSize: 10 } })
-    .setOption('vAxis', { title: 'eCPM', textStyle: { fontName: 'Roboto', fontSize: 10 } })
-    .setOption('colors', ['#0f9d58', '#1a73e8', '#f29900'])
-    .setOption('series', {
-      0: { lineWidth: 3, color: '#0f9d58' },
-      1: { lineWidth: 3, color: '#1a73e8' },
-      2: { lineWidth: 3, lineDashStyle: [6, 3], color: '#f29900' }
-    })
-    .setOption('useFirstColumnAsDomain', true)
-    .build();
+function insertOverviewCharts_(overview, helperSheet, endRow, currencyCode) {
+  const maxRow = Math.max((Number(endRow) || 0) + 1, 2);
+  const curr = String(currencyCode || 'USD').trim().toUpperCase() || 'USD';
+  (overview.getCharts() || []).forEach(function(ch) {
+    try {
+      overview.removeChart(ch);
+    } catch (e) {}
+  });
+
+  const baseLegend = { position: 'top', textStyle: { fontName: 'Roboto', fontSize: 11 } };
+  const axisStyle = { fontName: 'Roboto', fontSize: 10 };
+
+  const chartDefs = [
+    {
+      type: 'LINE',
+      anchorRow: 19,
+      ranges: [helperSheet.getRange('A1:D' + maxRow)],
+      title: 'Revenue Trends (' + curr + ')',
+      hTitle: 'Date',
+      vTitle: 'Revenue (' + curr + ')',
+      colors: ['#0f9d58', '#1a73e8', '#f29900'],
+      series: {
+        0: { lineWidth: 3, color: '#0f9d58' },
+        1: { lineWidth: 3, color: '#1a73e8' },
+        2: { lineWidth: 3, lineDashStyle: [6, 3], color: '#f29900' }
+      }
+    },
+    {
+      type: 'LINE',
+      anchorRow: 38,
+      ranges: [helperSheet.getRange('A1:A' + maxRow), helperSheet.getRange('U1:W' + maxRow)],
+      title: '',
+      hTitle: 'Date',
+      vTitle: 'OPMC Revenue (' + curr + ')',
+      colors: ['#1a73e8', '#9334e6', '#f29900'],
+      series: {
+        0: { lineWidth: 3, color: '#1a73e8' },
+        1: { lineWidth: 3, color: '#9334e6' },
+        2: { lineWidth: 3, color: '#f29900' }
+      }
+    },
+    {
+      type: 'LINE',
+      anchorRow: 57,
+      ranges: [helperSheet.getRange('A1:A' + maxRow), helperSheet.getRange('Q1:S' + maxRow)],
+      title: 'eCPM Trends (' + curr + ')',
+      hTitle: 'Date',
+      vTitle: 'eCPM (' + curr + ')',
+      colors: ['#0f9d58', '#1a73e8', '#f29900'],
+      series: {
+        0: { lineWidth: 3, color: '#0f9d58' },
+        1: { lineWidth: 3, color: '#1a73e8' },
+        2: { lineWidth: 3, lineDashStyle: [6, 3], color: '#f29900' }
+      }
+    },
+    {
+      type: 'STACKED_COLUMN',
+      anchorRow: 76,
+      ranges: [helperSheet.getRange('A1:A' + maxRow), helperSheet.getRange('C1:D' + maxRow)],
+      title: '',
+      hTitle: 'Date',
+      vTitle: 'Combined Revenue (' + curr + ')',
+      colors: ['#1a73e8', '#f29900']
+    },
+    {
+      type: 'STACKED_COLUMN',
+      anchorRow: 95,
+      ranges: [helperSheet.getRange('F1:H11')],
+      title: '',
+      hTitle: 'Country',
+      vTitle: 'Revenue (' + curr + ')',
+      colors: ['#1a73e8', '#f29900']
+    }
+  ];
+
+  chartDefs.forEach(function(def) {
+    let builder = overview.newChart();
+    if (def.type === 'LINE') {
+      builder = builder.asLineChart().setOption('curveType', 'function');
+    } else {
+      builder = builder.asColumnChart().setStacked();
+    }
+    def.ranges.forEach(function(rng) {
+      builder = builder.addRange(rng);
+    });
+    builder = builder
+      .setNumHeaders(1)
+      .setPosition(def.anchorRow, 2, 8, 4)
+      .setOption('width', 1190)
+      .setOption('height', 355)
+      .setOption('legend', baseLegend)
+      .setOption('hAxis', { title: def.hTitle, textStyle: axisStyle })
+      .setOption('vAxis', { title: def.vTitle, textStyle: axisStyle })
+      .setOption('colors', def.colors)
+      .setOption('useFirstColumnAsDomain', true);
+    if (def.title) {
+      builder = builder.setOption('title', def.title);
+    }
+    if (def.series) {
+      builder = builder.setOption('series', def.series);
+    }
+    overview.insertChart(builder.build());
+  });
 }
 
 /**
- * Upgrades an existing 3-chart Overview workbook to the 4-chart layout by inserting
- * the Daily eCPM Trends section at row 37 without overwriting user inputs or data.
+ * Returns the 43x10 cell value matrix for the v1.3 Instructions user guide.
  */
-function upgradeToFourChartLayoutIfNeeded_(ss) {
-  if (!ss) return;
-  const overview = ss.getSheetByName('Overview');
-  const helperSheet = ss.getSheetByName('Chart_Helper');
-  const dailySheet = ss.getSheetByName('Daily_Data');
-  if (!overview || !helperSheet || !dailySheet) return;
-
-  const b37 = String(overview.getRange('B37').getDisplayValue() || '').trim();
-  if (b37.toLowerCase().indexOf('ecpm') !== -1) return;
-  if (b37.toLowerCase().indexOf('stacked') === -1) return;
-
-  if (dailySheet.getMaxColumns() < 8) {
-    dailySheet.insertColumnsAfter(dailySheet.getMaxColumns(), 8 - dailySheet.getMaxColumns());
+function buildInstructionsRows_() {
+  const rows = [];
+  for (let r = 0; r < 43; r++) {
+    rows.push(['', '', '', '', '', '', '', '', '', '']);
   }
-  dailySheet.getRange('F1:H1')
-    .setValues([['Ad Exchange Impressions', 'On-platform multicall Impressions', 'Total Impressions']])
-    .setBackground('#0f9d58')
-    .setFontColor('#ffffff')
-    .setFontFamily('Google Sans')
-    .setFontSize(10)
-    .setFontWeight('bold')
-    .setHorizontalAlignment('center');
+  rows[1][1] = 'Google Ad Manager Unified Report: User Guide';
+  rows[2][1] = 'Google Sheets & Google Apps Script Reporting Tool';
+  rows[3][1] =
+    'This tool combines your Primary Google-settled programmatic revenue (Ad Exchange, Open Bidding, and SDK Bidding) with your On-Platform Multicall (OPMC) revenue into one report. Use this workbook to view daily trends, compare demand channels, and track revenue by ad unit.';
 
-  if (helperSheet.getMaxColumns() < 20) {
-    helperSheet.insertColumnsAfter(helperSheet.getMaxColumns(), 20 - helperSheet.getMaxColumns());
-  }
-  if (helperSheet.getMaxRows() < 405) {
-    helperSheet.insertRowsAfter(helperSheet.getMaxRows(), 405 - helperSheet.getMaxRows());
-  }
-  helperSheet.getRange('N1:S1').setValues([[
-    'Ad Exchange Impressions', 'On-platform multicall Impressions', 'Total Impressions',
-    'Total eCPM', 'Ad Exchange eCPM', 'On-platform multicall eCPM'
-  ]]);
-  if (String(helperSheet.getRange('Q2').getDisplayValue() || '') === '') {
-    helperSheet.getRange('N2:S2').setValues([[0, 0, 0, 0, 0, 0]]);
-  }
-  helperSheet.getRange('N2:P405').setNumberFormat('#,##0');
-  helperSheet.getRange('Q2:S405').setNumberFormat('$#,##0.00');
+  rows[5][1] = '▎ 1. Workbook Tabs';
+  rows[6][1] = '📊 Overview';
+  rows[6][3] =
+    'Run reports, filter data by ad unit, country, or demand channel, view total revenue cards, and check Revenue Trends, OPMC Revenue by Demand Channel, eCPM Trends, Stacked Incremental, and Country charts.';
+  rows[7][1] = '🧩 Ad Unit Breakdown';
+  rows[7][3] =
+    'View revenue for each Parent Ad Unit (A) combined with its OPMC Child Ad Units (A1 to An), filtered live by Demand Channel.';
 
-  overview.insertRowsAfter(36, 19);
-  overview.getRange('A37:J55')
+  rows[9][1] = '▎ 2. One-Time Setup: Google Cloud API and Apps Script';
+  rows[10][1] = 'Step';
+  rows[10][2] = 'Where to Go';
+  rows[10][4] = 'What to Do';
+  const setupSteps = [
+    ['Step 1', 'Google Cloud Console -> APIs & Services', 'Open your Google Cloud project and enable the Google Ad Manager API (admanager.googleapis.com).'],
+    ['Step 2', 'Google Cloud Console -> IAM & Admin -> IAM', 'Ensure your Google account has the Service Usage Consumer role (roles/serviceusage.serviceUsageConsumer) on that GCP project.'],
+    ['Step 3', 'Google Cloud Console -> Dashboard', 'Copy your GCP Project ID (or Project Number) from the Project info card on the Cloud Console Dashboard.'],
+    ['Step 4', 'Google Sheet -> Extensions -> Apps Script', 'In a blank Google Sheet, click Extensions -> Apps Script, enable Show "appsscript.json" manifest file in editor under Project Settings, paste Code.js and appsscript.json, and save.'],
+    ['Step 5', 'Apps Script -> Editor (< >) -> Toolbar', 'Select authorizeAndVerifyGamScope in the top toolbar, click Run, and approve the permission prompt to build all workbook tabs.'],
+    ['Step 6', 'Google Sheet -> Refresh Page & Cell I7', 'Refresh the Google Sheet browser tab once (Cmd+R or F5) to activate the buttons, enter your GCP Project ID in cell I7, and press Enter.']
+  ];
+  setupSteps.forEach(function(st, idx) {
+    rows[11 + idx][1] = st[0];
+    rows[11 + idx][2] = st[1];
+    rows[11 + idx][4] = st[2];
+  });
+
+  rows[18][1] = '▎ 3. How to Generate a Report (Step-by-Step)';
+  rows[19][1] = 'Step';
+  rows[19][2] = 'Action';
+  rows[19][4] = 'Instructions';
+  const runSteps = [
+    ['Step 1', 'Open the Overview tab', 'Click the Overview tab at the bottom of the sheet.'],
+    ['Step 2', 'Enter Network Code, Optional Filter, and Project ID', 'Type your Google Ad Manager Network Code in cell C7 (optional: enter an Ad Unit substring filter in cell C8) and your GCP Project ID in cell I7, then press Enter.'],
+    ['Step 3', 'Select your date range', 'Double-click cell F7 to select the Start Date and double-click cell F8 to select the End Date (YYYY-MM-DD).'],
+    ['Step 4', 'Run the report', 'Click the Generate Report button in row 10. Wait for the Report complete message to appear.']
+  ];
+  runSteps.forEach(function(st, idx) {
+    rows[20 + idx][1] = st[0];
+    rows[20 + idx][2] = st[1];
+    rows[20 + idx][4] = st[2];
+  });
+
+  rows[25][1] = '▎ 4. How to Use the Buttons and Filters in the "Overview" tab';
+  rows[26][1] = 'Button or Filter';
+  rows[26][3] = 'How to Use It';
+  const controls = [
+    ['⚡ Generate Report', 'Fetch new data from Google Ad Manager and update all charts and tables.'],
+    ['🔄 Reset Filters', 'Reset the Ad Unit, Country, and Demand Channel filters back to ALL.'],
+    ['📥 Download CSV', 'Download the full report as a CSV file.'],
+    ['🧹 Clear Data', 'Wipe all fetched report data from all sheets while preserving your settings and formulas.'],
+    ['📱 Filter by Ad Unit', 'Select an ad unit from cell C12 to show revenue for that unit. Selecting a Parent Ad Unit includes all associated OPMC child units.'],
+    ['🌍 Filter by Country', 'Select a country from the dropdown list in cell F12 to show revenue for that country only.'],
+    ['📡 Filter by Demand Channel', 'Select ALL, Ad Exchange, Open Bidding, or SDK Bidding in cell I12 to filter both Overview and Ad Unit Breakdown live.']
+  ];
+  controls.forEach(function(ctrl, idx) {
+    rows[27 + idx][1] = ctrl[0];
+    rows[27 + idx][3] = ctrl[1];
+  });
+
+  rows[35][1] = '▎ 5. Key Revenue Terms';
+  rows[36][1] = 'Term';
+  rows[36][3] = 'Meaning';
+  const terms = [
+    ['Primary Programmatic Revenue', 'Google-settled primary revenue from Ad Exchange, Open Bidding, and SDK Bidding (excludes Mediation and Ad Server to prevent double-counting).'],
+    ['OPMC Revenue', 'Additional Google-settled revenue (Ad Exchange, Open Bidding, and SDK Bidding) earned on On-Platform Multicall (OPMC) child ad units.'],
+    ['Total Unified Revenue', 'The sum of Primary Programmatic Revenue plus OPMC Revenue (100% mutually exclusive with zero double-counting).'],
+    ['Parent Ad Unit Rollup', 'On the Ad Unit Breakdown tab, Table 1 groups each Parent Ad Unit (A) with its OPMC Child Ad Units (A1 to An). Edit Column D in Table 2 to reassign any child unit.']
+  ];
+  terms.forEach(function(term, idx) {
+    rows[37 + idx][1] = term[0];
+    rows[37 + idx][3] = term[1];
+  });
+
+  return rows;
+}
+
+/**
+ * Formats and writes the 43x10 Instructions tab cleanly.
+ */
+function styleInstructionsSheet_(instSheet) {
+  if (!instSheet) return;
+  instSheet.clearContents();
+  instSheet.getRange(1, 1, instSheet.getMaxRows(), instSheet.getMaxColumns()).breakApart();
+  ensureSheetGridSize_(instSheet, 43, 10);
+  instSheet.setTabColor('#1a73e8');
+  instSheet.setHiddenGridlines(true);
+
+  const instColWidths = [26, 95, 155, 155, 165, 165, 165, 165, 165, 26];
+  for (let c = 0; c < instColWidths.length; c++) {
+    instSheet.setColumnWidth(c + 1, instColWidths[c]);
+  }
+
+  instSheet.getRange('A1:J43')
     .setBackground('#f1f3f4')
     .setFontColor('#202124')
     .setFontFamily('Google Sans')
     .setFontSize(10)
-    .setVerticalAlignment('middle');
-  overview.setRowHeight(37, 34);
-  overview.setRowHeights(38, 17, 22);
-  overview.setRowHeight(55, 18);
+    .setFontWeight('normal')
+    .setHorizontalAlignment('left')
+    .setVerticalAlignment('middle')
+    .setBorder(false, false, false, false, false, false);
 
-  overview.getRange('B37:G37').merge();
-  overview.getRange('H37:I37').merge();
-  overview.getRange('B37').setValue('▎ Daily eCPM Trends');
-  overview.getRange('H37').setFormula(
-    '="Active Filter: "&IF(C12<>"ALL", "Ad Unit = "&C12, IF(F12<>"ALL", "Country = "&F12, "All Inventory & Countries"))'
+  const instRows = buildInstructionsRows_();
+  instSheet.getRange(1, 1, 43, 10).setValues(instRows);
+
+  const rowHeights = [
+    [1, 1, 16], [2, 1, 38], [3, 1, 24], [4, 1, 44], [5, 1, 16],
+    [6, 1, 32], [7, 2, 34], [9, 1, 16], [10, 1, 32], [11, 1, 28],
+    [12, 6, 34], [18, 1, 16], [19, 1, 32], [20, 1, 28], [21, 4, 30],
+    [25, 1, 16], [26, 1, 32], [27, 1, 28], [28, 7, 30], [35, 1, 16],
+    [36, 1, 32], [37, 1, 28], [38, 3, 34], [41, 1, 44], [42, 2, 18]
+  ];
+  rowHeights.forEach(function(rh) {
+    if (rh[1] === 1) {
+      instSheet.setRowHeight(rh[0], rh[2]);
+    } else {
+      instSheet.setRowHeights(rh[0], rh[1], rh[2]);
+    }
+  });
+
+  ['B2:I2', 'B3:I3', 'B4:I4', 'B6:I6', 'B10:I10', 'B19:I19', 'B26:I26', 'B36:I36'].forEach(function(a1) {
+    instSheet.getRange(a1).merge();
+  });
+  [7, 8, 27, 28, 29, 30, 31, 32, 33, 34, 37, 38, 39, 40, 41].forEach(function(r) {
+    instSheet.getRange(r, 2, 1, 2).merge();
+    instSheet.getRange(r, 4, 1, 6).merge();
+  });
+  [11, 12, 13, 14, 15, 16, 17, 20, 21, 22, 23, 24].forEach(function(r) {
+    instSheet.getRange(r, 3, 1, 2).merge();
+    instSheet.getRange(r, 5, 1, 5).merge();
+  });
+
+  instSheet.getRange('B2:I4').setBackground('#ffffff');
+  instSheet.getRange('B2').setFontSize(16).setFontWeight('bold').setFontColor('#1a73e8');
+  instSheet.getRange('B3').setFontSize(10).setFontWeight('bold').setFontColor('#5f6368');
+  instSheet.getRange('B4:I4').setBackground('#f8f9fa').setFontSize(10).setFontColor('#3c4043').setWrap(true);
+  styleCardBox_(instSheet.getRange('B2:I4'), '#dadce0', '#1a73e8');
+
+  [
+    { hdr: 'B6:I6', box: 'B6:I8', tblHdr: null },
+    { hdr: 'B10:I10', box: 'B10:I17', tblHdr: 'B11:I11' },
+    { hdr: 'B19:I19', box: 'B19:I24', tblHdr: 'B20:I20' },
+    { hdr: 'B26:I26', box: 'B26:I34', tblHdr: 'B27:I27' },
+    { hdr: 'B36:I36', box: 'B36:I41', tblHdr: 'B37:I37' }
+  ].forEach(function(sec) {
+    instSheet.getRange(sec.box)
+      .setBackground('#ffffff')
+      .setWrap(true)
+      .setBorder(true, true, true, true, true, true, '#dadce0', SpreadsheetApp.BorderStyle.SOLID);
+    instSheet.getRange(sec.hdr).setBackground('#ffffff').setFontColor('#1a73e8').setFontSize(12).setFontWeight('bold');
+    if (sec.tblHdr) {
+      instSheet.getRange(sec.tblHdr).setBackground('#1a73e8').setFontColor('#ffffff').setFontWeight('bold');
+    }
+  });
+  instSheet.getRange('B7:C8').setFontWeight('bold');
+  instSheet.getRange('B12:B17').setFontWeight('bold').setHorizontalAlignment('center');
+  instSheet.getRange('B21:B24').setFontWeight('bold').setHorizontalAlignment('center');
+  instSheet.getRange('B28:C34').setFontWeight('bold');
+  instSheet.getRange('B38:C41').setFontWeight('bold');
+}
+
+/**
+ * Applies the v1.3 Overview formulas, styles, validations, and 5-chart card containers.
+ */
+function styleOverviewV13Body_(overview, helperSheet, currFmt) {
+  const fmt = currFmt || '$#,##0.00';
+  const chCritLocal = 'IF(OR(I12="ALL",I12=""),"*",I12)';
+
+  overview.getRange('B7:I8').breakApart();
+  overview.getRange('H7:H8').merge();
+  overview.getRange('I7:I8').merge();
+  overview.getRange('C7:C8').setNumberFormat('@');
+  overview.getRange('I7:I8').setNumberFormat('@');
+  overview.getRange('F7:F8').setNumberFormat('yyyy-mm-dd');
+  overview.getRange('B8').setValue('Ad Unit Filter (Optional)');
+  overview.getRange('H6').setFormula(
+    '=IF(C12<>"ALL", "Filtered records (Ad Unit: "&C12&"): "&TEXT(COUNTIFS(Ad_Unit_Data!C2:C, C12, Ad_Unit_Data!K2:K, ' +
+      chCritLocal +
+      ') + COUNTIFS(Ad_Unit_Data!J2:J, C12, Ad_Unit_Data!K2:K, ' +
+      chCritLocal +
+      '), "#,##0"), IF(F12<>"ALL", "Filtered records (Country: "&F12&"): "&TEXT(COUNTIFS(Country_Data!C2:C, F12, Country_Data!J2:J, ' +
+      chCritLocal +
+      '), "#,##0"), IF(AND(C8<>"", UPPER(C8)<>"ALL", C8<>"<INSERT_HERE>"), "Filtered records (Query: "&C8&"): "&TEXT(COUNTIF(Ad_Unit_Data!K2:K, ' +
+      chCritLocal +
+      '), "#,##0"), "Dataset records ("&IF(OR(I12="ALL",I12=""),"All Channels",I12)&"): "&TEXT(COUNTIF(Ad_Unit_Data!K2:K, ' +
+      chCritLocal +
+      '), "#,##0"))))'
   );
-  overview.getRange('B37:I54').setBackground('#ffffff');
-  styleCardBox_(overview.getRange('B37:I54'), '#dadce0');
-  overview.getRange('B37:G37').setFontColor('#1a73e8').setFontSize(12).setFontWeight('bold');
-  overview.getRange('H37:I37').setFontColor('#5f6368').setFontSize(9).setFontWeight('bold').setHorizontalAlignment('right');
+  ['B7:B8', 'E7:E8', 'H7:H8'].forEach(function(lblRange) {
+    overview.getRange(lblRange).setFontColor('#5f6368').setFontSize(9).setFontWeight('bold').setHorizontalAlignment('right');
+  });
+  ['C7', 'C8', 'F7', 'F8', 'I7:I8'].forEach(function(inpRange) {
+    const r = overview.getRange(inpRange);
+    r.setBackground('#f8f9fa').setFontColor('#202124').setFontSize(10).setFontWeight('bold').setHorizontalAlignment('left');
+    r.setBorder(true, true, true, true, false, false, '#dadce0', SpreadsheetApp.BorderStyle.SOLID);
+  });
 
-  overview.insertChart(buildDailyEcpmChart_(overview, helperSheet, 38, 400));
+  overview.getRange('H11:I12').breakApart();
+  overview.getRange('H11:I11').merge();
+  overview.getRange('H11').setValue('📡 Filter by Demand Channel (Select below)');
+  overview.getRange('H12').setValue('Demand Channel:');
+  overview.getRange('I12').setValue('ALL');
+  overview.getRange('H11:I11').setBackground('#ffffff').setFontColor('#5f6368').setFontSize(9).setFontWeight('bold').setHorizontalAlignment('left');
+  overview.getRange('H12').setBackground('#ffffff').setFontColor('#5f6368').setFontSize(9).setFontWeight('bold').setHorizontalAlignment('right').setNumberFormat('@');
+  overview.getRange('I12')
+    .setBackground('#e6f4ea')
+    .setFontColor('#137333')
+    .setFontSize(10)
+    .setFontWeight('bold')
+    .setHorizontalAlignment('left')
+    .setNumberFormat('@')
+    .setBorder(true, true, true, true, false, false, '#0f9d58', SpreadsheetApp.BorderStyle.SOLID);
+  styleCardBox_(overview.getRange('B11:I12'), '#dadce0');
+
+  overview.getRange('B14').setFormula('=IF(OR(I12="ALL",I12=""), "PRIMARY REVENUE (ADX + OB + SDKB)", UPPER(I12)&" PRIMARY REVENUE")');
+  overview.getRange('E14').setFormula('=IF(OR(I12="ALL",I12=""), "OPMC REVENUE (ADX + OB + SDKB)", "OPMC "&UPPER(I12)&" REVENUE")');
+  overview.getRange('H14').setValue('TOTAL UNIFIED REVENUE');
+  overview.getRange('B15').setFormula(
+    '=IF(C12<>"ALL", SUMIFS(Ad_Unit_Data!D2:D, Ad_Unit_Data!C2:C, C12, Ad_Unit_Data!K2:K, ' +
+      chCritLocal +
+      ') + SUMIFS(Ad_Unit_Data!D2:D, Ad_Unit_Data!J2:J, C12, Ad_Unit_Data!K2:K, ' +
+      chCritLocal +
+      '), IF(F12<>"ALL", SUMIFS(Country_Data!D2:D, Country_Data!C2:C, F12, Country_Data!J2:J, ' +
+      chCritLocal +
+      '), SUMIFS(Ad_Unit_Data!D2:D, Ad_Unit_Data!K2:K, ' +
+      chCritLocal +
+      ')))'
+  );
+  overview.getRange('E15').setFormula(
+    '=IF(C12<>"ALL", SUMIFS(Ad_Unit_Data!E2:E, Ad_Unit_Data!C2:C, C12, Ad_Unit_Data!K2:K, ' +
+      chCritLocal +
+      ') + SUMIFS(Ad_Unit_Data!E2:E, Ad_Unit_Data!J2:J, C12, Ad_Unit_Data!K2:K, ' +
+      chCritLocal +
+      '), IF(F12<>"ALL", SUMIFS(Country_Data!E2:E, Country_Data!C2:C, F12, Country_Data!J2:J, ' +
+      chCritLocal +
+      '), SUMIFS(Ad_Unit_Data!E2:E, Ad_Unit_Data!K2:K, ' +
+      chCritLocal +
+      ')))'
+  );
+  overview.getRange('H15').setFormula('=B15+E15');
+  overview.getRange('B15:C15').setNumberFormat(fmt);
+  overview.getRange('E15:F15').setNumberFormat(fmt);
+  overview.getRange('H15:I15').setNumberFormat(fmt);
+  overview.getRange('B16').setFormula('="Share: "&TEXT(IF(H15>0, B15/H15, 0), "0.0%")&"  •  "&TEXT(SUM(Chart_Helper!N2:N), "#,##0")&" imps"');
+  overview.getRange('E16').setFormula('="Share: "&TEXT(IF(H15>0, E15/H15, 0), "0.0%")&"  •  "&TEXT(SUM(Chart_Helper!O2:O), "#,##0")&" imps"');
+  overview.getRange('H16').setFormula('="Uplift: +"&TEXT(IF(B15>0, E15/B15, 0), "0.0%")&"  •  "&TEXT(SUM(Chart_Helper!P2:P), "#,##0")&" imps"');
+
+  ensureSheetGridSize_(overview, 114, 10);
+  const canvasRange = overview.getRange('A17:J114');
+  canvasRange.breakApart();
+  canvasRange.clearContent();
+  canvasRange
+    .setBackground('#f1f3f4')
+    .setFontColor('#202124')
+    .setFontFamily('Google Sans')
+    .setFontSize(10)
+    .setFontWeight('normal')
+    .setHorizontalAlignment('left')
+    .setVerticalAlignment('middle')
+    .setBorder(false, false, false, false, false, false);
+
+  const chartContainers = [
+    { row: 18, box: 'B18:I35', titleRange: 'B18:G18', subRange: 'H18:I18', title: '▎ Revenue Trends', color: '#1a73e8' },
+    { row: 37, box: 'B37:I54', titleRange: 'B37:G37', subRange: 'H37:I37', title: '▎ OPMC Revenue by Demand Channel', color: '#9334e6' },
+    { row: 56, box: 'B56:I73', titleRange: 'B56:G56', subRange: 'H56:I56', title: '▎ eCPM Trends', color: '#1a73e8' },
+    { row: 75, box: 'B75:I92', titleRange: 'B75:G75', subRange: 'H75:I75', title: '▎ Stacked Incremental Revenue', color: '#0f9d58' },
+    { row: 94, box: 'B94:I111', titleRange: 'B94:G94', subRange: 'H94:I94', title: '▎ Country Revenue Breakdown (Top 10 Countries)', color: '#f29900' }
+  ];
+  chartContainers.forEach(function(ch) {
+    overview.setRowHeight(ch.row - 1, 18);
+    overview.setRowHeight(ch.row, 34);
+    overview.setRowHeights(ch.row + 1, 17, 22);
+    overview.getRange(ch.titleRange).merge();
+    overview.getRange(ch.subRange).merge();
+    overview.getRange(ch.box).setBackground('#ffffff');
+    styleCardBox_(overview.getRange(ch.box), '#dadce0');
+    overview.getRange(ch.row, 2).setValue(ch.title);
+    overview.getRange(ch.row, 8).setFormula(ACTIVE_FILTER_FORMULA);
+    overview.getRange(ch.titleRange).setFontColor(ch.color).setFontSize(12).setFontWeight('bold');
+    overview.getRange(ch.subRange).setFontColor('#5f6368').setFontSize(9).setFontWeight('bold').setHorizontalAlignment('right');
+  });
+  overview.setRowHeights(112, 3, 18);
+
+  if (helperSheet) {
+    overview.getRange('I12').setDataValidation(
+      SpreadsheetApp.newDataValidation().requireValueInRange(helperSheet.getRange('T2:T5'), true).setAllowInvalid(true).build()
+    );
+  }
+}
+
+/**
+ * Upgrades an existing pre-v1.3 workbook in-place to the 5-chart v1.3 schema and layout.
+ */
+function upgradeToV13LayoutIfNeeded_(ss, currencySymbol) {
+  if (!ss) return;
+  const overview = ss.getSheetByName('Overview');
+  const helperSheet = ss.getSheetByName('Chart_Helper');
+  const unitSheet = ss.getSheetByName('Ad_Unit_Data');
+  const countrySheet = ss.getSheetByName('Country_Data');
+  const dailySheet = ss.getSheetByName('Daily_Data');
+  const instSheet = ss.getSheetByName('Instructions');
+  if (!overview || !helperSheet || !unitSheet || !countrySheet || !dailySheet) return;
+
+  const h12 = String(overview.getRange('H12').getDisplayValue() || '').trim();
+  const b37 = String(overview.getRange('B37').getDisplayValue() || '').toLowerCase();
+  const alreadyV13 =
+    h12 === 'Demand Channel:' &&
+    b37.indexOf('demand channel') !== -1 &&
+    overview.getMaxRows() >= 114 &&
+    helperSheet.getMaxColumns() >= 26 &&
+    unitSheet.getMaxColumns() >= 11 &&
+    countrySheet.getMaxColumns() >= 10 &&
+    dailySheet.getMaxColumns() >= 14;
+  if (alreadyV13) return;
+
+  const cSym = String(currencySymbol || '$').replace(/"/g, '');
+  const currFmt = cSym === '$' ? '$#,##0.00' : '"' + cSym + '"#,##0.00';
+
+  if (unitSheet.getMaxColumns() < 11) {
+    unitSheet.insertColumnsAfter(unitSheet.getMaxColumns(), 11 - unitSheet.getMaxColumns());
+  }
+  unitSheet.getRange('A1:K1').setValues([[
+    'Date', 'Raw_Date', 'Ad_Unit', 'Primary_Revenue', 'OPMC_Revenue', 'Total_Revenue',
+    'Primary_Impressions', 'OPMC_Impressions', 'Total_Impressions', 'Parent_Ad_Unit', 'Demand_Channel'
+  ]]).setBackground('#1a73e8').setFontColor('#ffffff').setFontFamily('Google Sans').setFontSize(10).setFontWeight('bold').setHorizontalAlignment('center');
+
+  if (countrySheet.getMaxColumns() < 10) {
+    countrySheet.insertColumnsAfter(countrySheet.getMaxColumns(), 10 - countrySheet.getMaxColumns());
+  }
+  countrySheet.getRange('A1:J1').setValues([[
+    'Date', 'Raw_Date', 'Country', 'Primary_Revenue', 'OPMC_Revenue', 'Total_Revenue',
+    'Primary_Impressions', 'OPMC_Impressions', 'Total_Impressions', 'Demand_Channel'
+  ]]).setBackground('#1a73e8').setFontColor('#ffffff').setFontFamily('Google Sans').setFontSize(10).setFontWeight('bold').setHorizontalAlignment('center');
+
+  if (dailySheet.getMaxColumns() < 14) {
+    dailySheet.insertColumnsAfter(dailySheet.getMaxColumns(), 14 - dailySheet.getMaxColumns());
+  }
+  dailySheet.getRange('A1:N1').setValues([[
+    'Date', 'Raw_Date', 'Primary Programmatic Revenue', 'OPMC Revenue', 'Total Revenue',
+    'Primary Impressions', 'OPMC Impressions', 'Total Impressions',
+    'OPMC Ad Exchange Revenue', 'OPMC Open Bidding Revenue', 'OPMC SDK Bidding Revenue',
+    'Primary Ad Exchange Revenue', 'Primary Open Bidding Revenue', 'Primary SDK Bidding Revenue'
+  ]]).setBackground('#0f9d58').setFontColor('#ffffff').setFontFamily('Google Sans').setFontSize(10).setFontWeight('bold').setHorizontalAlignment('center');
+
+  if (helperSheet.getMaxColumns() < 26) {
+    helperSheet.insertColumnsAfter(helperSheet.getMaxColumns(), 26 - helperSheet.getMaxColumns());
+  }
+  if (helperSheet.getMaxRows() < 405) {
+    helperSheet.insertRowsAfter(helperSheet.getMaxRows(), 405 - helperSheet.getMaxRows());
+  }
+  helperSheet.getRange('T1:T5').setValues([['Demand_Channel_Options'], ['ALL'], ['Ad Exchange'], ['Open Bidding'], ['SDK Bidding']]);
+  helperSheet.getRange('U1:W1').setValues([['OPMC — Ad Exchange', 'OPMC — Open Bidding', 'OPMC — SDK Bidding']]);
+  if (String(helperSheet.getRange('U2').getDisplayValue() || '') === '') {
+    helperSheet.getRange('U2:W2').setValues([[0, 0, 0]]);
+  }
+
+  if (instSheet) {
+    styleInstructionsSheet_(instSheet);
+  }
+
+  styleOverviewV13Body_(overview, helperSheet, currFmt);
+  const currCode = String(helperSheet.getRange('M2').getDisplayValue() || 'USD').trim() || 'USD';
+  insertOverviewCharts_(overview, helperSheet, 400, currCode);
 }
 
 /**
  * Automatically creates and formats all 7 workbook tabs (Instructions, Overview,
  * Ad Unit Breakdown, Ad_Unit_Data, Country_Data, Daily_Data, and Chart_Helper),
  * formulas, dropdowns, and embedded charts when run on a blank Google Sheet.
- * Upgrades 3-chart sheets to 4 charts if needed; otherwise no-op when tabs exist.
+ * Upgrades pre-v1.3 sheets to v1.3 when needed; otherwise no-op when already v1.3.
  */
 function setupWorkbook_() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
@@ -304,21 +752,21 @@ function setupWorkbook_() {
     ss.getSheetByName('Ad Unit Breakdown')
   ) {
     try {
-      upgradeToFourChartLayoutIfNeeded_(ss);
+      upgradeToV13LayoutIfNeeded_(ss, '$');
     } catch (e) {}
     return;
   }
 
   // 1. Create or configure hidden data and helper sheets first so formula & validation ranges resolve cleanly.
-  let unitSheet = ss.getSheetByName('Ad_Unit_Data') || ss.insertSheet('Ad_Unit_Data');
-  ensureSheetGridSize_(unitSheet, 200, 10);
+  const unitSheet = ss.getSheetByName('Ad_Unit_Data') || ss.insertSheet('Ad_Unit_Data');
+  ensureSheetGridSize_(unitSheet, 200, 11);
   unitSheet.setTabColor('#1a73e8');
   unitSheet.setFrozenRows(1);
-  unitSheet.getRange('A1:I1').setValues([[
-    'Date', 'Raw_Date', 'Ad_Unit', 'AdX_Revenue', 'OPMC_Revenue',
-    'Total_Revenue', 'AdX_Impressions', 'OPMC_Impressions', 'Total_Impressions'
+  unitSheet.getRange('A1:K1').setValues([[
+    'Date', 'Raw_Date', 'Ad_Unit', 'Primary_Revenue', 'OPMC_Revenue', 'Total_Revenue',
+    'Primary_Impressions', 'OPMC_Impressions', 'Total_Impressions', 'Parent_Ad_Unit', 'Demand_Channel'
   ]]);
-  unitSheet.getRange('A1:I1')
+  unitSheet.getRange('A1:K1')
     .setBackground('#1a73e8')
     .setFontColor('#ffffff')
     .setFontFamily('Google Sans')
@@ -328,15 +776,15 @@ function setupWorkbook_() {
   unitSheet.getRange('D2:F200').setNumberFormat('$#,##0.00');
   unitSheet.getRange('G2:I200').setNumberFormat('#,##0');
 
-  let countrySheet = ss.getSheetByName('Country_Data') || ss.insertSheet('Country_Data');
+  const countrySheet = ss.getSheetByName('Country_Data') || ss.insertSheet('Country_Data');
   ensureSheetGridSize_(countrySheet, 200, 10);
   countrySheet.setTabColor('#f29900');
   countrySheet.setFrozenRows(1);
-  countrySheet.getRange('A1:I1').setValues([[
-    'Date', 'Raw_Date', 'Country', 'AdX_Revenue', 'OPMC_Revenue',
-    'Total_Revenue', 'AdX_Impressions', 'OPMC_Impressions', 'Total_Impressions'
+  countrySheet.getRange('A1:J1').setValues([[
+    'Date', 'Raw_Date', 'Country', 'Primary_Revenue', 'OPMC_Revenue', 'Total_Revenue',
+    'Primary_Impressions', 'OPMC_Impressions', 'Total_Impressions', 'Demand_Channel'
   ]]);
-  countrySheet.getRange('A1:I1')
+  countrySheet.getRange('A1:J1')
     .setBackground('#1a73e8')
     .setFontColor('#ffffff')
     .setFontFamily('Google Sans')
@@ -346,15 +794,17 @@ function setupWorkbook_() {
   countrySheet.getRange('D2:F200').setNumberFormat('$#,##0.00');
   countrySheet.getRange('G2:I200').setNumberFormat('#,##0');
 
-  let dailySheet = ss.getSheetByName('Daily_Data') || ss.insertSheet('Daily_Data');
-  ensureSheetGridSize_(dailySheet, 405, 8);
+  const dailySheet = ss.getSheetByName('Daily_Data') || ss.insertSheet('Daily_Data');
+  ensureSheetGridSize_(dailySheet, 405, 14);
   dailySheet.setTabColor('#0f9d58');
   dailySheet.setFrozenRows(1);
-  dailySheet.getRange('A1:H1').setValues([[
-    'Date', 'Raw_Date', 'Ad Exchange Revenue', 'On-platform multicall Revenue', 'Total Revenue',
-    'Ad Exchange Impressions', 'On-platform multicall Impressions', 'Total Impressions'
+  dailySheet.getRange('A1:N1').setValues([[
+    'Date', 'Raw_Date', 'Primary Programmatic Revenue', 'OPMC Revenue', 'Total Revenue',
+    'Primary Impressions', 'OPMC Impressions', 'Total Impressions',
+    'OPMC Ad Exchange Revenue', 'OPMC Open Bidding Revenue', 'OPMC SDK Bidding Revenue',
+    'Primary Ad Exchange Revenue', 'Primary Open Bidding Revenue', 'Primary SDK Bidding Revenue'
   ]]);
-  dailySheet.getRange('A1:H1')
+  dailySheet.getRange('A1:N1')
     .setBackground('#0f9d58')
     .setFontColor('#ffffff')
     .setFontFamily('Google Sans')
@@ -363,228 +813,37 @@ function setupWorkbook_() {
     .setHorizontalAlignment('center');
   dailySheet.getRange('C2:E405').setNumberFormat('$#,##0.00');
   dailySheet.getRange('F2:H405').setNumberFormat('#,##0');
+  dailySheet.getRange('I2:N405').setNumberFormat('$#,##0.00');
 
-  let helperSheet = ss.getSheetByName('Chart_Helper') || ss.insertSheet('Chart_Helper');
-  ensureSheetGridSize_(helperSheet, 405, 20);
+  const helperSheet = ss.getSheetByName('Chart_Helper') || ss.insertSheet('Chart_Helper');
+  ensureSheetGridSize_(helperSheet, 405, 26);
   helperSheet.setTabColor('#9aa0a6');
   helperSheet.setFrozenRows(1);
-  helperSheet.getRange('A1:S2').setValues([
+  helperSheet.getRange('A1:W2').setValues([
     [
-      'Date', 'Total Revenue', 'Ad Exchange Revenue', 'On-platform multicall Revenue', '',
-      'Country', 'Ad Exchange Revenue', 'On-platform multicall Revenue', 'Total Revenue', '',
+      'Date', 'Total Revenue', 'Primary Programmatic Revenue', 'OPMC Revenue', '',
+      'Country', 'Primary Programmatic Revenue', 'OPMC Revenue', 'Total Revenue', '',
       'Ad_Unit_Options', 'Country_Options', 'Currency_Code',
-      'Ad Exchange Impressions', 'On-platform multicall Impressions', 'Total Impressions',
-      'Total eCPM', 'Ad Exchange eCPM', 'On-platform multicall eCPM'
+      'Primary Impressions', 'OPMC Impressions', 'Total Impressions',
+      'Total eCPM', 'Primary eCPM', 'OPMC eCPM',
+      'Demand_Channel_Options', 'OPMC — Ad Exchange', 'OPMC — Open Bidding', 'OPMC — SDK Bidding'
     ],
-    ['—', 0, 0, 0, '', '—', 0, 0, 0, '', 'ALL', 'ALL', 'USD', 0, 0, 0, 0, 0, 0]
+    ['—', 0, 0, 0, '', '—', 0, 0, 0, '', 'ALL', 'ALL', 'USD', 0, 0, 0, 0, 0, 0, 'ALL', 0, 0, 0]
   ]);
+  helperSheet.getRange('T3:T5').setValues([['Ad Exchange'], ['Open Bidding'], ['SDK Bidding']]);
   helperSheet.getRange('B2:D405').setNumberFormat('$#,##0.00');
   helperSheet.getRange('G2:I15').setNumberFormat('$#,##0.00');
   helperSheet.getRange('N2:P405').setNumberFormat('#,##0');
   helperSheet.getRange('Q2:S405').setNumberFormat('$#,##0.00');
+  helperSheet.getRange('U2:W405').setNumberFormat('$#,##0.00');
 
   // 2. Build the Instructions tab.
-  let instSheet = ss.getSheetByName('Instructions') || ss.insertSheet('Instructions');
-  ensureSheetGridSize_(instSheet, 47, 10);
-  instSheet.setTabColor('#1a73e8');
-  instSheet.setHiddenGridlines(true);
+  const instSheet = ss.getSheetByName('Instructions') || ss.insertSheet('Instructions');
+  styleInstructionsSheet_(instSheet);
 
-  const instColWidths = [26, 95, 155, 155, 165, 165, 165, 165, 165, 26];
-  for (let c = 0; c < instColWidths.length; c++) {
-    instSheet.setColumnWidth(c + 1, instColWidths[c]);
-  }
-
-  instSheet.getRange('A1:J47')
-    .setBackground('#f1f3f4')
-    .setFontColor('#202124')
-    .setFontFamily('Google Sans')
-    .setFontSize(10)
-    .setVerticalAlignment('middle');
-
-  const instRows = [];
-  for (let r = 0; r < 47; r++) {
-    instRows.push(['', '', '', '', '', '', '', '', '', '']);
-  }
-  instRows[1][1] = 'Google Ad Manager Unified Report: User Guide';
-  instRows[2][1] = 'Google Sheets & Google Apps Script Reporting Tool';
-  instRows[3][1] = 'This tool combines your Ad Exchange revenue and your On-Platform Multicall (OPMC) revenue into one report. Use this workbook to view daily trends, compare country performance, and see total revenue for each ad unit.';
-
-  instRows[5][1] = '▎ 1. Workbook Tabs';
-  instRows[6][1] = '📊 Overview';
-  instRows[6][3] = 'Run reports, filter data by ad unit or country, view total revenue cards, and check daily revenue, daily eCPM, incremental, and country charts.';
-  instRows[7][1] = '🧩 Ad Unit Breakdown';
-  instRows[7][3] = 'View revenue for each Parent Ad Unit (A) combined with its OPMC Child Ad Units (A1, A2, A3, A4).';
-
-  instRows[9][1] = '▎ 2. One-Time Setup: Google Cloud API and Apps Script';
-  instRows[10][1] = 'Step';
-  instRows[10][2] = 'Where to Go';
-  instRows[10][4] = 'What to Do';
-  instRows[11][1] = 'Step 1';
-  instRows[11][2] = 'Google Cloud Console -> APIs & Services';
-  instRows[11][4] = 'Open your Google Cloud project and enable the Google Ad Manager API (admanager.googleapis.com).';
-  instRows[12][1] = 'Step 2';
-  instRows[12][2] = 'Google Cloud Console -> IAM & Admin -> IAM';
-  instRows[12][4] = 'Ensure your Google account has the Service Usage Consumer role (roles/serviceusage.serviceUsageConsumer) on that GCP project.';
-  instRows[13][1] = 'Step 3';
-  instRows[13][2] = 'Google Cloud Console -> Dashboard';
-  instRows[13][4] = 'Copy your GCP Project ID (or Project Number) from the Project info card on the Cloud Console Dashboard.';
-  instRows[14][1] = 'Step 4';
-  instRows[14][2] = 'Google Sheet -> Extensions -> Apps Script';
-  instRows[14][4] = 'In a blank Google Sheet, click Extensions -> Apps Script, enable Show "appsscript.json" manifest file in editor under Project Settings, paste Code.js and appsscript.json, and save.';
-  instRows[15][1] = 'Step 5';
-  instRows[15][2] = 'Apps Script -> Editor (< >) -> Toolbar';
-  instRows[15][4] = 'Select authorizeAndVerifyGamScope in the top toolbar, click Run, and approve the permission prompt to build all workbook tabs.';
-  instRows[16][1] = 'Step 6';
-  instRows[16][2] = 'Google Sheet -> Refresh Page & Cell I7';
-  instRows[16][4] = 'Refresh the Google Sheet browser tab once (Cmd+R or F5) to activate the buttons, enter your GCP Project ID in cell I7, and press Enter.';
-
-  instRows[18][1] = '▎ 3. How to Generate a Report (Step-by-Step)';
-  instRows[19][1] = 'Step';
-  instRows[19][2] = 'Action';
-  instRows[19][4] = 'Instructions';
-  instRows[20][1] = 'Step 1';
-  instRows[20][2] = 'Open the Overview tab';
-  instRows[20][4] = 'Click the Overview tab at the bottom of the sheet.';
-  instRows[21][1] = 'Step 2';
-  instRows[21][2] = 'Enter Network Code and Project ID';
-  instRows[21][4] = 'Type your Google Ad Manager Network Code in cell C7 and your GCP Project ID in cell I7, then press Enter.';
-  instRows[22][1] = 'Step 3';
-  instRows[22][2] = 'Select your date range';
-  instRows[22][4] = 'Double-click cell F7 to select the Start Date and double-click cell F8 to select the End Date (YYYY-MM-DD).';
-  instRows[23][1] = 'Step 4';
-  instRows[23][2] = 'Run the report';
-  instRows[23][4] = 'Click the Generate Report button in row 10. Wait for the Report complete message to appear.';
-
-  instRows[25][1] = '▎ 4. How to Use the Buttons and Filters in the "Overview" tab';
-  instRows[26][1] = 'Button or Filter';
-  instRows[26][3] = 'How to Use It';
-  instRows[27][1] = '⚡ Generate Report';
-  instRows[27][3] = 'Fetch new data from Google Ad Manager and update all charts and tables.';
-  instRows[28][1] = '🔄 Reset Filters';
-  instRows[28][3] = 'Reset both the Ad Unit filter and the Country filter back to ALL.';
-  instRows[29][1] = '📥 Download CSV';
-  instRows[29][3] = 'Download the full report as a CSV file.';
-  instRows[30][1] = '🧹 Clear Data';
-  instRows[30][3] = 'Wipe all fetched report data from all sheets while preserving your settings and formulas.';
-  instRows[31][1] = '📱 Filter by Ad Unit';
-  instRows[31][3] = 'Select an ad unit from the dropdown list in cell C12 to show revenue for that ad unit only.';
-  instRows[32][1] = '🌍 Filter by Country';
-  instRows[32][3] = 'Select a country from the dropdown list in cell F12 to show revenue for that country only.';
-
-  instRows[34][1] = '▎ 5. Key Revenue Terms';
-  instRows[35][1] = 'Term';
-  instRows[35][3] = 'Meaning';
-  instRows[36][1] = 'Ad Exchange Revenue';
-  instRows[36][3] = 'Revenue from standard Google Ad Exchange auctions on your ad units.';
-  instRows[37][1] = 'OPMC Revenue';
-  instRows[37][3] = 'Additional revenue from On-Platform Multicall (OPMC) mediation ad units.';
-  instRows[38][1] = 'Total Revenue';
-  instRows[38][3] = 'The sum of Ad Exchange Revenue plus OPMC Revenue.';
-  instRows[39][1] = 'Parent Ad Unit Rollup';
-  instRows[39][3] = 'On the Ad Unit Breakdown tab, Table 1 groups each Parent Ad Unit (A) with its OPMC Child Ad Units (A1 to A4). If you change a parent name in Table 2 (Column D), Table 1 updates automatically.';
-
-  instRows[41][1] = '▎ 6. Version History & Changelog';
-  instRows[42][1] = 'Version';
-  instRows[42][2] = 'Release Date';
-  instRows[42][3] = 'Key Features & Enhancements';
-  instRows[43][1] = 'v1.1';
-  instRows[43][2] = 'November 2026';
-  instRows[43][3] =
-    'Daily eCPM Trends & Self-Service Setup\n' +
-    '• Daily eCPM Trends Chart: Adds a dedicated Daily eCPM Trends chart (Total, Ad Exchange, and OPMC eCPM) on Overview that updates with the Ad Unit and Country filters.\n' +
-    '• Self-Service Workbook Setup: Automatically creates and formats all workbook tabs, formulas, buttons, and charts on first run in a blank Google Sheet.\n' +
-    '• Executive Scorecard Subtitles: Shows Share of Total (%) on Ad Exchange and OPMC cards and Incremental Uplift (+%) on Total Revenue.\n' +
-    '• Dynamic Chart Scaling & CSV eCPM: Scales daily chart axes to the exact report date range and adds daily eCPM columns to CSV exports.';
-  instRows[44][1] = 'v1.0';
-  instRows[44][2] = 'October 2026';
-  instRows[44][3] =
-    'Initial Release (Google Sheets and Apps Script)\n' +
-    '• Google Ad Manager API Integration: Gets Ad Exchange and OPMC report data in parallel from admanager.googleapis.com.\n' +
-    '• Parent Ad Unit Rollup: Groups each Parent Ad Unit (A) with its OPMC Child Ad Units (A1 to A4) on the Ad Unit Breakdown tab.\n' +
-    '• Overview Charts: Shows three charts: Daily Revenue Trends, Stacked Incremental Revenue, and Country Revenue Breakdown.\n' +
-    '• Live Filters: Filters the Overview tab by Ad Unit (C12) or Country (F12) and resets filters with Reset Filters (E10).\n' +
-    '• CSV Export & Clear Data: Exports a four-section CSV via downloadCsvFromSheet() and clears report data safely via clearReportData().';
-
-  instSheet.getRange(1, 1, instRows.length, 10).setValues(instRows);
-
-  instSheet.setRowHeight(1, 16);
-  instSheet.setRowHeight(2, 38);
-  instSheet.setRowHeight(3, 24);
-  instSheet.setRowHeight(4, 44);
-  instSheet.setRowHeight(5, 16);
-  instSheet.setRowHeight(6, 32);
-  instSheet.setRowHeights(7, 2, 30);
-  instSheet.setRowHeight(9, 16);
-  instSheet.setRowHeight(10, 32);
-  instSheet.setRowHeight(11, 28);
-  instSheet.setRowHeights(12, 6, 34);
-  instSheet.setRowHeight(18, 16);
-  instSheet.setRowHeight(19, 32);
-  instSheet.setRowHeight(20, 28);
-  instSheet.setRowHeights(21, 4, 30);
-  instSheet.setRowHeight(25, 16);
-  instSheet.setRowHeight(26, 32);
-  instSheet.setRowHeight(27, 28);
-  instSheet.setRowHeights(28, 6, 30);
-  instSheet.setRowHeight(34, 16);
-  instSheet.setRowHeight(35, 32);
-  instSheet.setRowHeight(36, 28);
-  instSheet.setRowHeights(37, 3, 30);
-  instSheet.setRowHeight(40, 44);
-  instSheet.setRowHeight(41, 16);
-  instSheet.setRowHeight(42, 32);
-  instSheet.setRowHeight(43, 28);
-  instSheet.setRowHeight(44, 128);
-  instSheet.setRowHeight(45, 134);
-
-  // Merge and style Instructions cards.
-  ['B2:I2', 'B3:I3', 'B4:I4', 'B6:I6', 'B10:I10', 'B19:I19', 'B26:I26', 'B35:I35', 'B42:I42'].forEach(function(a1) {
-    instSheet.getRange(a1).merge();
-  });
-  [7, 8, 27, 28, 29, 30, 31, 32, 33, 36, 37, 38, 39, 40].forEach(function(r) {
-    instSheet.getRange(r, 2, 1, 2).merge();
-    instSheet.getRange(r, 4, 1, 6).merge();
-  });
-  [11, 12, 13, 14, 15, 16, 17, 20, 21, 22, 23, 24].forEach(function(r) {
-    instSheet.getRange(r, 3, 1, 2).merge();
-    instSheet.getRange(r, 5, 1, 5).merge();
-  });
-  instSheet.getRange('D43:I43').merge();
-  instSheet.getRange('D44:I44').merge();
-  instSheet.getRange('D45:I45').merge();
-
-  instSheet.getRange('B2:I4').setBackground('#ffffff');
-  instSheet.getRange('B2').setFontSize(16).setFontWeight('bold').setFontColor('#1a73e8');
-  instSheet.getRange('B3').setFontSize(10).setFontWeight('bold').setFontColor('#5f6368');
-  instSheet.getRange('B4:I4').setBackground('#f8f9fa').setFontSize(10).setFontColor('#3c4043').setWrap(true);
-  styleCardBox_(instSheet.getRange('B2:I4'), '#dadce0', '#1a73e8');
-
-  [
-    { hdr: 'B6:I6', box: 'B6:I8', tblHdr: null },
-    { hdr: 'B10:I10', box: 'B10:I17', tblHdr: 'B11:I11' },
-    { hdr: 'B19:I19', box: 'B19:I24', tblHdr: 'B20:I20' },
-    { hdr: 'B26:I26', box: 'B26:I33', tblHdr: 'B27:I27' },
-    { hdr: 'B35:I35', box: 'B35:I40', tblHdr: 'B36:I36' },
-    { hdr: 'B42:I42', box: 'B42:I45', tblHdr: 'B43:I43' }
-  ].forEach(function(sec) {
-    instSheet.getRange(sec.box).setBackground('#ffffff').setWrap(true);
-    instSheet.getRange(sec.box).setBorder(true, true, true, true, true, true, '#dadce0', SpreadsheetApp.BorderStyle.SOLID);
-    instSheet.getRange(sec.hdr).setBackground('#ffffff').setFontColor('#1a73e8').setFontSize(12).setFontWeight('bold');
-    if (sec.tblHdr) {
-      instSheet.getRange(sec.tblHdr).setBackground('#1a73e8').setFontColor('#ffffff').setFontWeight('bold');
-    }
-  });
-  instSheet.getRange('B7:C8').setFontWeight('bold');
-  instSheet.getRange('B12:B17').setFontWeight('bold').setHorizontalAlignment('center');
-  instSheet.getRange('B21:B24').setFontWeight('bold').setHorizontalAlignment('center');
-  instSheet.getRange('B28:C33').setFontWeight('bold');
-  instSheet.getRange('B37:C40').setFontWeight('bold');
-  instSheet.getRange('B44:C45').setFontWeight('bold').setHorizontalAlignment('center').setVerticalAlignment('top');
-  instSheet.getRange('D44:I45').setVerticalAlignment('top');
-
-  // 3. Build the Overview tab (95 rows, 4 chart sections).
-  let overview = ss.getSheetByName('Overview') || ss.insertSheet('Overview');
-  ensureSheetGridSize_(overview, 95, 10);
+  // 3. Build the Overview tab (114 rows, 5 chart sections).
+  const overview = ss.getSheetByName('Overview') || ss.insertSheet('Overview');
+  ensureSheetGridSize_(overview, 114, 10);
   overview.setTabColor('#1a73e8');
   overview.setHiddenGridlines(true);
 
@@ -593,7 +852,7 @@ function setupWorkbook_() {
     overview.setColumnWidth(c + 1, ovColWidths[c]);
   }
 
-  overview.getRange('A1:J95')
+  overview.getRange('A1:J114')
     .setBackground('#f1f3f4')
     .setFontColor('#202124')
     .setFontFamily('Google Sans')
@@ -602,7 +861,7 @@ function setupWorkbook_() {
 
   const todayIso = Utilities.formatDate(new Date(), ss.getSpreadsheetTimeZone() || 'UTC', 'yyyy-MM-dd');
   const ovValues = [];
-  for (let r = 0; r < 95; r++) {
+  for (let r = 0; r < 114; r++) {
     ovValues.push(['', '', '', '', '', '', '', '', '', '']);
   }
 
@@ -611,8 +870,6 @@ function setupWorkbook_() {
     'Copyright Google LLC. Supported by Google LLC and/or its affiliate(s). This solution, including any related sample code or data, is made available on an “as is,” “as available,” and “with all faults” basis, solely for illustrative purposes, and without warranty or representation of any kind. This solution is experimental, unsupported and provided solely for your convenience. Your use of it is subject to your agreements with Google, as applicable, and may constitute a beta feature as defined under those agreements. To the extent that you make any data available to Google in connection with your use of the solution, you represent and warrant that you have all necessary and appropriate rights, consents and permissions to permit Google to use and process that data. By using any portion of this solution, you acknowledge, assume and accept all risks, known and unknown, associated with its usage and any processing of data by Google, including with respect to your deployment of any portion of this solution in your systems, or usage in connection with your business, if at all. In connection with this solution, you will not provide to Google any personally identifiable information, personal information or personal data.';
 
   ovValues[5][1] = '▎ Report Parameters';
-  ovValues[5][7] = '=IF(C12<>"ALL", "Filtered dataset records (Ad Unit: "&C12&"): "&TEXT(COUNTIF(Ad_Unit_Data!C2:C, C12), "#,##0"), IF(F12<>"ALL", "Filtered dataset records (Country: "&F12&"): "&TEXT(COUNTIF(Country_Data!C2:C, F12), "#,##0"), "Filtered dataset records (All Ad Units): "&TEXT(COUNTA(Ad_Unit_Data!A2:A), "#,##0")))';
-
   ovValues[6][1] = 'Network Code';
   ovValues[6][2] = '<INSERT_HERE>';
   ovValues[6][4] = 'Start Date (YYYY-MM-DD)';
@@ -620,6 +877,8 @@ function setupWorkbook_() {
   ovValues[6][7] = 'GCP Project ID (Quota)';
   ovValues[6][8] = '<INSERT_HERE>';
 
+  ovValues[7][1] = 'Ad Unit Filter (Optional)';
+  ovValues[7][2] = '';
   ovValues[7][4] = 'End Date (YYYY-MM-DD)';
   ovValues[7][5] = todayIso;
 
@@ -630,45 +889,25 @@ function setupWorkbook_() {
 
   ovValues[10][1] = '📱 Filter by Ad Unit (Select below)';
   ovValues[10][4] = '🌍 Filter by Country (Select below)';
-  ovValues[10][7] = '📊 Total Filtered Impressions';
+  ovValues[10][7] = '📡 Filter by Demand Channel (Select below)';
 
   ovValues[11][1] = 'Ad Unit Filter:';
   ovValues[11][2] = 'ALL';
   ovValues[11][4] = 'Country Filter:';
   ovValues[11][5] = 'ALL';
-  ovValues[11][7] = '=IF(C12<>"ALL", SUMIF(Ad_Unit_Data!C2:C, C12, Ad_Unit_Data!I2:I), IF(F12<>"ALL", SUMIF(Country_Data!C2:C, F12, Country_Data!I2:I), SUM(Ad_Unit_Data!I2:I)))';
+  ovValues[11][7] = 'Demand Channel:';
+  ovValues[11][8] = 'ALL';
 
-  ovValues[13][1] = 'AD EXCHANGE REVENUE';
   ovValues[13][3] = '="+"';
-  ovValues[13][4] = 'OPMC REVENUE';
   ovValues[13][6] = '="="';
-  ovValues[13][7] = 'TOTAL REVENUE';
+  ovValues[13][7] = 'TOTAL UNIFIED REVENUE';
 
-  ovValues[14][1] = '=IF(C12<>"ALL", SUMIF(Ad_Unit_Data!C2:C, C12, Ad_Unit_Data!D2:D), IF(F12<>"ALL", SUMIF(Country_Data!C2:C, F12, Country_Data!D2:D), SUM(Ad_Unit_Data!D2:D)))';
-  ovValues[14][4] = '=IF(C12<>"ALL", SUMIF(Ad_Unit_Data!C2:C, C12, Ad_Unit_Data!E2:E), IF(F12<>"ALL", SUMIF(Country_Data!C2:C, F12, Country_Data!E2:E), SUM(Ad_Unit_Data!E2:E)))';
-  ovValues[14][7] = '=B15+E15';
-
-  ovValues[15][1] = '="Share of Total: "&TEXT(IF(H15>0, B15/H15, 0), "0.0%")';
-  ovValues[15][4] = '="Share of Total: "&TEXT(IF(H15>0, E15/H15, 0), "0.0%")';
-  ovValues[15][7] = '="Incremental Uplift: +"&TEXT(IF(B15>0, E15/B15, 0), "0.0%")';
-
-  ovValues[17][1] = '▎ Daily Revenue Trends';
-  ovValues[17][7] = '="Active Filter: "&IF(C12<>"ALL", "Ad Unit = "&C12, IF(F12<>"ALL", "Country = "&F12, "All Inventory & Countries"))';
-
-  ovValues[36][1] = '▎ Daily eCPM Trends';
-  ovValues[36][7] = '="Active Filter: "&IF(C12<>"ALL", "Ad Unit = "&C12, IF(F12<>"ALL", "Country = "&F12, "All Inventory & Countries"))';
-
-  ovValues[55][1] = '▎ Stacked Incremental Revenue';
-
-  ovValues[74][1] = '▎ Country Revenue Breakdown (Top 10 Countries)';
-
-  // Format plain-text ID inputs before setting values so IDs never convert to scientific notation.
   overview.getRange('C7:C8').setNumberFormat('@');
   overview.getRange('I7:I8').setNumberFormat('@');
+  overview.getRange('I12').setNumberFormat('@');
   overview.getRange(1, 1, ovValues.length, 10).setValues(ovValues);
   overview.getRange('F7:F8').setNumberFormat('yyyy-mm-dd');
 
-  // Set exact Overview row heights.
   overview.setRowHeight(1, 16);
   overview.setRowHeights(2, 2, 26);
   overview.setRowHeight(4, 70);
@@ -683,59 +922,28 @@ function setupWorkbook_() {
   overview.setRowHeight(14, 28);
   overview.setRowHeight(15, 52);
   overview.setRowHeight(16, 28);
-  overview.setRowHeight(17, 18);
-  overview.setRowHeight(18, 34);
-  overview.setRowHeights(19, 17, 22);
-  overview.setRowHeight(36, 18);
-  overview.setRowHeight(37, 34);
-  overview.setRowHeights(38, 17, 22);
-  overview.setRowHeight(55, 18);
-  overview.setRowHeight(56, 34);
-  overview.setRowHeights(57, 17, 22);
-  overview.setRowHeight(74, 18);
-  overview.setRowHeight(75, 34);
-  overview.setRowHeights(76, 17, 22);
-  overview.setRowHeights(93, 3, 18);
 
-  // Merge Overview ranges.
   [
     'B2:I3', 'B4:I4',
     'B6:G6', 'H6:I6',
-    'B7:B8', 'C7:C8', 'H7:H8', 'I7:I8',
     'B10:C10', 'H10:I10',
-    'B11:C11', 'E11:F11', 'H11:I11', 'H12:I12',
+    'B11:C11', 'E11:F11', 'H11:I11',
     'B14:C14', 'B15:C15', 'B16:C16', 'D14:D16',
     'E14:F14', 'E15:F15', 'E16:F16', 'G14:G16',
-    'H14:I14', 'H15:I15', 'H16:I16',
-    'B18:G18', 'H18:I18',
-    'B37:G37', 'H37:I37',
-    'B56:G56', 'H56:I56',
-    'B75:G75', 'H75:I75'
+    'H14:I14', 'H15:I15', 'H16:I16'
   ].forEach(function(a1) {
     overview.getRange(a1).merge();
   });
 
-  // Style Header Card (B2:I4).
   overview.getRange('B2:I3').setBackground('#ffffff').setFontColor('#202124').setFontSize(16).setFontWeight('bold');
   overview.getRange('B4:I4').setBackground('#f8f9fa').setFontColor('#5f6368').setFontSize(9).setWrap(true);
   styleCardBox_(overview.getRange('B2:I4'), '#dadce0', '#1a73e8');
 
-  // Style Report Parameters Card (B6:I8).
   overview.getRange('B6:I8').setBackground('#ffffff');
   styleCardBox_(overview.getRange('B6:I8'), '#dadce0');
   overview.getRange('B6:G6').setFontColor('#1a73e8').setFontSize(12).setFontWeight('bold');
   overview.getRange('H6:I6').setBackground('#e8f0fe').setFontColor('#1967d2').setFontSize(9).setFontWeight('bold').setHorizontalAlignment('center');
 
-  ['B7:B8', 'E7:E8', 'H7:H8'].forEach(function(lblRange) {
-    overview.getRange(lblRange).setFontColor('#5f6368').setFontSize(9).setFontWeight('bold').setHorizontalAlignment('right');
-  });
-  ['C7:C8', 'F7', 'F8', 'I7:I8'].forEach(function(inpRange) {
-    const r = overview.getRange(inpRange);
-    r.setBackground('#f8f9fa').setFontColor('#202124').setFontSize(10).setFontWeight('bold').setHorizontalAlignment('left');
-    r.setBorder(true, true, true, true, false, false, '#dadce0', SpreadsheetApp.BorderStyle.SOLID);
-  });
-
-  // Style Row 10 Action Buttons.
   overview.getRange('B10:C10')
     .setBackground('#1a73e8')
     .setFontColor('#ffffff')
@@ -765,11 +973,8 @@ function setupWorkbook_() {
     .setHorizontalAlignment('center')
     .setBorder(true, true, true, true, false, false, '#0b5323', SpreadsheetApp.BorderStyle.SOLID_MEDIUM);
 
-  // Style Filters Card (B11:I12).
   overview.getRange('B11:I12').setBackground('#ffffff');
-  styleCardBox_(overview.getRange('B11:I12'), '#dadce0');
   overview.getRange('B11:F11').setFontColor('#5f6368').setFontSize(9).setFontWeight('bold');
-  overview.getRange('H11:I11').setFontColor('#5f6368').setFontSize(9).setFontWeight('bold').setHorizontalAlignment('center');
   overview.getRange('B12').setFontColor('#5f6368').setFontSize(9).setFontWeight('bold').setHorizontalAlignment('right');
   overview.getRange('C12')
     .setBackground('#e8f0fe')
@@ -784,15 +989,7 @@ function setupWorkbook_() {
     .setFontSize(10)
     .setFontWeight('bold')
     .setBorder(true, true, true, true, false, false, '#f29900', SpreadsheetApp.BorderStyle.SOLID);
-  overview.getRange('H12:I12')
-    .setBackground('#f8f9fa')
-    .setFontColor('#202124')
-    .setFontSize(12)
-    .setFontWeight('bold')
-    .setHorizontalAlignment('center')
-    .setNumberFormat('#,##0');
 
-  // Style Executive Scorecards Row (B14:I16).
   overview.getRange('B14:C16').setBackground('#ffffff');
   overview.getRange('B14:C14').setFontColor('#5f6368').setFontSize(10).setFontWeight('bold');
   overview.getRange('B15:C15').setFontColor('#202124').setFontSize(22).setFontWeight('bold').setNumberFormat('$#,##0.00');
@@ -815,101 +1012,21 @@ function setupWorkbook_() {
   overview.getRange('H16:I16').setFontColor('#137333').setFontSize(8).setFontWeight('bold');
   styleCardBox_(overview.getRange('H14:I16'), '#ceead6', '#0f9d58');
 
-  // Style the 4 Chart Containers.
-  [
-    { box: 'B18:I35', title: 'B18:G18', sub: 'H18:I18', color: '#1a73e8' },
-    { box: 'B37:I54', title: 'B37:G37', sub: 'H37:I37', color: '#1a73e8' },
-    { box: 'B56:I73', title: 'B56:G56', sub: 'H56:I56', color: '#0f9d58' },
-    { box: 'B75:I92', title: 'B75:G75', sub: 'H75:I75', color: '#f29900' }
-  ].forEach(function(ch) {
-    overview.getRange(ch.box).setBackground('#ffffff');
-    styleCardBox_(overview.getRange(ch.box), '#dadce0');
-    overview.getRange(ch.title).setFontColor(ch.color).setFontSize(12).setFontWeight('bold');
-    overview.getRange(ch.sub).setFontColor('#5f6368').setFontSize(9).setFontWeight('bold').setHorizontalAlignment('right');
-  });
+  overview.getRange('F7:F8').setDataValidation(
+    SpreadsheetApp.newDataValidation().requireDate().setAllowInvalid(true).build()
+  );
+  overview.getRange('C12').setDataValidation(
+    SpreadsheetApp.newDataValidation().requireValueInRange(helperSheet.getRange('K2:K500'), true).setAllowInvalid(true).build()
+  );
+  overview.getRange('F12').setDataValidation(
+    SpreadsheetApp.newDataValidation().requireValueInRange(helperSheet.getRange('L2:L300'), true).setAllowInvalid(true).build()
+  );
 
-  // Apply Data Validations on Overview (Calendar pickers on F7:F8 and dynamic dropdowns on C12 & F12).
-  const dateRule = SpreadsheetApp.newDataValidation()
-    .requireDate()
-    .setAllowInvalid(true)
-    .build();
-  overview.getRange('F7:F8').setDataValidation(dateRule);
-
-  const unitRule = SpreadsheetApp.newDataValidation()
-    .requireValueInRange(helperSheet.getRange('K2:K500'), true)
-    .setAllowInvalid(true)
-    .build();
-  overview.getRange('C12').setDataValidation(unitRule);
-
-  const countryRule = SpreadsheetApp.newDataValidation()
-    .requireValueInRange(helperSheet.getRange('L2:L300'), true)
-    .setAllowInvalid(true)
-    .build();
-  overview.getRange('F12').setDataValidation(countryRule);
-
-  // Add the 4 Embedded Charts on Overview if not already present.
-  if (overview.getCharts().length === 0) {
-    const chart1 = overview.newChart()
-      .asLineChart()
-      .addRange(helperSheet.getRange('A1:D400'))
-      .setNumHeaders(1)
-      .setPosition(19, 2, 8, 4)
-      .setOption('title', 'Daily Revenue Trends')
-      .setOption('width', 1190)
-      .setOption('height', 355)
-      .setOption('legend', { position: 'top', textStyle: { fontName: 'Roboto', fontSize: 11 } })
-      .setOption('curveType', 'function')
-      .setOption('hAxis', { title: 'Date', textStyle: { fontName: 'Roboto', fontSize: 10 } })
-      .setOption('vAxis', { title: 'Revenue', textStyle: { fontName: 'Roboto', fontSize: 10 } })
-      .setOption('colors', ['#0f9d58', '#1a73e8', '#f29900'])
-      .setOption('series', {
-        0: { lineWidth: 3, color: '#0f9d58' },
-        1: { lineWidth: 3, color: '#1a73e8' },
-        2: { lineWidth: 3, lineDashStyle: [6, 3], color: '#f29900' }
-      })
-      .setOption('useFirstColumnAsDomain', true)
-      .build();
-    overview.insertChart(chart1);
-
-    const chartEcpm = buildDailyEcpmChart_(overview, helperSheet, 38, 400);
-    overview.insertChart(chartEcpm);
-
-    const chart2 = overview.newChart()
-      .asColumnChart()
-      .setStacked()
-      .addRange(helperSheet.getRange('A1:A400'))
-      .addRange(helperSheet.getRange('C1:D400'))
-      .setNumHeaders(1)
-      .setPosition(57, 2, 8, 4)
-      .setOption('width', 1190)
-      .setOption('height', 355)
-      .setOption('legend', { position: 'top', textStyle: { fontName: 'Roboto', fontSize: 11 } })
-      .setOption('hAxis', { title: 'Date', textStyle: { fontName: 'Roboto', fontSize: 10 } })
-      .setOption('vAxis', { title: 'Combined Revenue (AdX + OPMC)', textStyle: { fontName: 'Roboto', fontSize: 10 } })
-      .setOption('colors', ['#1a73e8', '#f29900'])
-      .setOption('useFirstColumnAsDomain', true)
-      .build();
-    overview.insertChart(chart2);
-
-    const chart3 = overview.newChart()
-      .asColumnChart()
-      .setStacked()
-      .addRange(helperSheet.getRange('F1:H11'))
-      .setNumHeaders(1)
-      .setPosition(76, 2, 8, 4)
-      .setOption('width', 1190)
-      .setOption('height', 355)
-      .setOption('legend', { position: 'top', textStyle: { fontName: 'Roboto', fontSize: 11 } })
-      .setOption('hAxis', { title: 'Country', textStyle: { fontName: 'Roboto', fontSize: 10 } })
-      .setOption('vAxis', { title: 'Revenue', textStyle: { fontName: 'Roboto', fontSize: 10 } })
-      .setOption('colors', ['#1a73e8', '#f29900'])
-      .setOption('useFirstColumnAsDomain', true)
-      .build();
-    overview.insertChart(chart3);
-  }
+  styleOverviewV13Body_(overview, helperSheet, '$#,##0.00');
+  insertOverviewCharts_(overview, helperSheet, 400, 'USD');
 
   // 4. Build and style the Ad Unit Breakdown tab.
-  let breakdown = ss.getSheetByName('Ad Unit Breakdown') || ss.insertSheet('Ad Unit Breakdown');
+  const breakdown = ss.getSheetByName('Ad Unit Breakdown') || ss.insertSheet('Ad Unit Breakdown');
   ensureSheetGridSize_(breakdown, 60, 10);
   breakdown.setTabColor('#0f9d58');
   breakdown.setHiddenGridlines(true);
@@ -1108,7 +1225,7 @@ function onOpen() {
 }
 
 /**
- * Resets the Ad Unit filter (C12) and the Country filter (F12) on the Overview tab to "ALL".
+ * Resets the Ad Unit filter (C12), Country filter (F12), and Demand Channel filter (I12) to "ALL".
  */
 function resetSheetFilters() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
@@ -1116,6 +1233,7 @@ function resetSheetFilters() {
   if (!dash) return;
   dash.getRange('C12').setValue('ALL');
   dash.getRange('F12').setValue('ALL');
+  dash.getRange('I12').setValue('ALL');
   SpreadsheetApp.flush();
 }
 
@@ -1136,57 +1254,53 @@ function clearReportData() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   if (!ss) return;
 
-  // 1. Clear data rows in the hidden Ad_Unit_Data tab and keep the header row.
+  // 1. Clear data rows in hidden data tabs while keeping headers.
+  ['Ad_Unit_Data', 'Country_Data', 'Daily_Data'].forEach(function(tabName) {
+    const sh = ss.getSheetByName(tabName);
+    if (sh) {
+      const lastRow = sh.getLastRow();
+      if (lastRow > 1) {
+        sh.getRange(2, 1, lastRow - 1, sh.getLastColumn()).clearContent();
+      }
+    }
+  });
   const unitSheet = ss.getSheetByName('Ad_Unit_Data');
-  if (unitSheet) {
-    const lastRow = unitSheet.getLastRow();
-    if (lastRow > 1) {
-      unitSheet.getRange(2, 1, lastRow - 1, unitSheet.getLastColumn()).clearContent();
-    }
-  }
-
-  // 2. Clear data rows in the hidden Country_Data tab and keep the header row.
   const countrySheet = ss.getSheetByName('Country_Data');
-  if (countrySheet) {
-    const lastRow = countrySheet.getLastRow();
-    if (lastRow > 1) {
-      countrySheet.getRange(2, 1, lastRow - 1, countrySheet.getLastColumn()).clearContent();
-    }
-  }
-
-  // 3. Clear data rows in the hidden Daily_Data tab and keep the header row.
   const dailySheet = ss.getSheetByName('Daily_Data');
-  if (dailySheet) {
-    const lastRow = dailySheet.getLastRow();
-    if (lastRow > 1) {
-      dailySheet.getRange(2, 1, lastRow - 1, dailySheet.getLastColumn()).clearContent();
-    }
-  }
 
-  // 4. Reset the hidden Chart_Helper tab.
+  // 2. Reset the hidden Chart_Helper tab while keeping chart ranges cleanly seeded.
   const helperSheet = ss.getSheetByName('Chart_Helper');
   if (helperSheet) {
-    // Clear daily helper rows in columns A to D and eCPM columns N to S, and seed row 2 with 0s so chart series stay bound.
     const clearRows = Math.max(helperSheet.getLastRow(), 400);
     helperSheet.getRange(2, 1, clearRows, 4).clearContent();
-    helperSheet.getRange('A2:D2').setValues([['—', 0, 0, 0]]);
+    helperSheet.getRange('A1:D2').setValues([
+      ['Date', 'Total Revenue', 'Primary Programmatic Revenue', 'OPMC Revenue'],
+      ['—', 0, 0, 0]
+    ]);
     helperSheet.getRange('B2:D400').setNumberFormat('$#,##0.00');
 
-    if (helperSheet.getMaxColumns() >= 19) {
+    if (helperSheet.getMaxColumns() >= 26) {
       helperSheet.getRange(2, 14, clearRows, 6).clearContent();
       helperSheet.getRange('N1:S2').setValues([
         [
-          'Ad Exchange Impressions', 'On-platform multicall Impressions', 'Total Impressions',
-          'Total eCPM', 'Ad Exchange eCPM', 'On-platform multicall eCPM'
+          'Primary Impressions', 'OPMC Impressions', 'Total Impressions',
+          'Total eCPM', 'Primary eCPM', 'OPMC eCPM'
         ],
         [0, 0, 0, 0, 0, 0]
       ]);
       helperSheet.getRange('N2:P400').setNumberFormat('#,##0');
       helperSheet.getRange('Q2:S400').setNumberFormat('$#,##0.00');
+
+      helperSheet.getRange('T1:T5').setValues([['Demand_Channel_Options'], ['ALL'], ['Ad Exchange'], ['Open Bidding'], ['SDK Bidding']]);
+      helperSheet.getRange(2, 21, clearRows, 3).clearContent();
+      helperSheet.getRange('U1:W2').setValues([
+        ['OPMC — Ad Exchange', 'OPMC — Open Bidding', 'OPMC — SDK Bidding'],
+        [0, 0, 0]
+      ]);
+      helperSheet.getRange('U2:W400').setNumberFormat('$#,##0.00');
     }
 
-    // Reset the top 10 countries table in columns F to I and seed row 2 with 0s.
-    helperSheet.getRange('F1:I1').setValues([['Country', 'Ad Exchange Revenue', 'On-platform multicall Revenue', 'Total Revenue']]);
+    helperSheet.getRange('F1:I1').setValues([['Country', 'Primary Programmatic Revenue', 'OPMC Revenue', 'Total Revenue']]);
     helperSheet.getRange(2, 6, 15, 4).clearContent();
     helperSheet.getRange('F2:I2').setValues([['—', 0, 0, 0]]);
     helperSheet.getRange('G2:I15').setNumberFormat('$#,##0.00');
@@ -1196,18 +1310,16 @@ function clearReportData() {
       syncOverviewCharts_(dashForCharts, helperSheet, 0, 'USD');
     }
 
-    // Reset filter dropdown lists in columns K and L to "ALL".
     helperSheet.getRange(1, 11, Math.max(helperSheet.getLastRow(), 150), 1).clearContent();
     helperSheet.getRange('K1:K2').setValues([['Ad_Unit_Options'], ['ALL']]);
 
     helperSheet.getRange(1, 12, Math.max(helperSheet.getLastRow(), 250), 1).clearContent();
     helperSheet.getRange('L1:L2').setValues([['Country_Options'], ['ALL']]);
 
-    // Set the default currency code in column M to "USD".
     helperSheet.getRange('M1:M2').setValues([['Currency_Code'], ['USD']]);
   }
 
-  // 5. Clear data rows in the Ad Unit Breakdown tab.
+  // 3. Clear data rows in the Ad Unit Breakdown tab.
   try {
     writeParentAdUnitBreakdownSheet_(ss, {
       ad_unit_rows: [],
@@ -1216,11 +1328,12 @@ function clearReportData() {
     });
   } catch (err) {}
 
-  // 6. Reset the filter cells and scorecard currency format on the Overview tab.
+  // 4. Reset the filter cells and scorecard currency format on the Overview tab.
   const dash = getTargetDashboardSheet_(ss);
   if (dash) {
     dash.getRange('C12').setValue('ALL');
     dash.getRange('F12').setValue('ALL');
+    dash.getRange('I12').setValue('ALL');
     try {
       dash.getRange('B15').setNumberFormat('$#,##0.00');
       dash.getRange('E15').setNumberFormat('$#,##0.00');
@@ -1228,7 +1341,7 @@ function clearReportData() {
     } catch (e) {}
   }
 
-  // 7. Hide the data and helper tabs.
+  // 5. Hide the data and helper tabs.
   [unitSheet, countrySheet, dailySheet, helperSheet].forEach(function(s) {
     if (s) {
       try { s.hideSheet(); } catch (e) {}
@@ -1274,6 +1387,7 @@ function onSelectionChange(e) {
     if (cellText.indexOf('Reset Filters') !== -1) {
       sheet.getRange('C12').setValue('ALL');
       sheet.getRange('F12').setValue('ALL');
+      sheet.getRange('I12').setValue('ALL');
       sheet.getRange('C12').activate();
       SpreadsheetApp.flush();
     } else if (
@@ -1281,8 +1395,6 @@ function onSelectionChange(e) {
       cellText.indexOf('Download') !== -1 ||
       cellText.indexOf('Generate Report') !== -1
     ) {
-      // Simple triggers run in AuthMode.LIMITED and cannot call ScriptApp.getOAuthToken() or UI modals.
-      // If clicking row 10 selected the underlying cell instead of the floating button, prompt a one-time refresh.
       sheet.getRange('C7').activate();
       const ss = e.source || SpreadsheetApp.getActiveSpreadsheet();
       if (ss) {
@@ -1446,9 +1558,10 @@ function downloadCsvFromSheet() {
   const fileName = 'ad_manager_unified_report_' + netCode + '.csv';
 
   const rollup = buildParentAdUnitRollup_(cached.ad_unit_rows || []);
+  const childToParent = rollup.childToParent || {};
   const lines = [];
   lines.push('Parent Ad Unit Revenue Summary');
-  lines.push('Parent Ad Unit,OPMC Child Units Count,Associated OPMC Ad Units,Ad Exchange Revenue (' + curr + '),OPMC Revenue (' + curr + '),Total Revenue (' + curr + '),AdX Share (%),OPMC Share (%),Total Impressions');
+  lines.push('Parent Ad Unit,OPMC Child Units Count,Associated OPMC Ad Units,Primary Programmatic Revenue (' + curr + '),OPMC Revenue (' + curr + '),Total Revenue (' + curr + '),Primary Share (%),OPMC Share (%),Total Impressions');
   (rollup.parentRows || []).forEach(function(pr) {
     lines.push([
       '"' + String(pr.parentName || '').replace(/"/g, '""') + '"',
@@ -1457,20 +1570,21 @@ function downloadCsvFromSheet() {
       pr.adxRev,
       pr.opmcRev,
       pr.totalRev,
-      (pr.adxShare * 100).toFixed(1) + '%',
-      (pr.opmcShare * 100).toFixed(1) + '%',
+      ((pr.adxShare || 0) * 100).toFixed(1),
+      ((pr.opmcShare || 0) * 100).toFixed(1),
       pr.totalImps
     ].join(','));
   });
 
-  // Group daily revenue and impression totals by date for Stacked Incremental Revenue & eCPM.
+  // Group daily revenue and impression totals by date across all settled channels.
   const dailyMap = {};
   (cached.ad_unit_rows || []).forEach(function(r) {
-    const dKey = String(r.raw_date || r.date || '').trim();
+    const isoDate = formatCsvDateOnly_(r.date, r.raw_date);
+    const dKey = String(r.raw_date || isoDate || '').trim();
     if (!dKey) return;
     if (!dailyMap[dKey]) {
       dailyMap[dKey] = {
-        date: r.date,
+        date: isoDate,
         raw_date: dKey,
         adxRev: 0,
         opmcRev: 0,
@@ -1497,16 +1611,16 @@ function downloadCsvFromSheet() {
 
   lines.push('');
   lines.push('Daily Incremental Revenue & eCPM');
-  lines.push('Date,Ad Exchange Revenue (' + curr + '),OPMC Incremental Revenue (' + curr + '),Total Revenue (' + curr + '),AdX Share (%),OPMC Share (%),OPMC Incremental Uplift (%),Ad Exchange eCPM (' + curr + '),OPMC eCPM (' + curr + '),Total eCPM (' + curr + '),Total Impressions');
+  lines.push('Date,Primary Programmatic Revenue (' + curr + '),OPMC Incremental Revenue (' + curr + '),Total Revenue (' + curr + '),Primary Share (%),OPMC Share (%),OPMC Incremental Uplift (%),Primary eCPM (' + curr + '),OPMC eCPM (' + curr + '),Total eCPM (' + curr + '),Total Impressions');
   sortedDailyKeys.forEach(function(k) {
     const d = dailyMap[k];
     const ar = Math.round(d.adxRev * 100) / 100;
     const or = Math.round(d.opmcRev * 100) / 100;
     const tr = Math.round((ar + or) * 100) / 100;
-    const adxPct = tr > 0 ? ((ar / tr) * 100).toFixed(1) + '%' : '0.0%';
-    const opmcPct = tr > 0 ? ((or / tr) * 100).toFixed(1) + '%' : '0.0%';
-    const upliftPct = ar > 0 ? '+' + ((or / ar) * 100).toFixed(1) + '%' : '0.0%';
-    const adxEcpm = d.adxImps > 0 ? ((d.adxRev / d.adxImps) * 1000).toFixed(2) : '0.00';
+    const primPct = tr > 0 ? ((ar / tr) * 100).toFixed(1) : '0.0';
+    const opmcPct = tr > 0 ? ((or / tr) * 100).toFixed(1) : '0.0';
+    const upliftPct = ar > 0 ? ((or / ar) * 100).toFixed(1) : '0.0';
+    const primEcpm = d.adxImps > 0 ? ((d.adxRev / d.adxImps) * 1000).toFixed(2) : '0.00';
     const opmcEcpm = d.opmcImps > 0 ? ((d.opmcRev / d.opmcImps) * 1000).toFixed(2) : '0.00';
     const totEcpm = d.totalImps > 0 ? ((d.totalRev / d.totalImps) * 1000).toFixed(2) : '0.00';
     lines.push([
@@ -1514,10 +1628,10 @@ function downloadCsvFromSheet() {
       ar,
       or,
       tr,
-      adxPct,
+      primPct,
       opmcPct,
       upliftPct,
-      adxEcpm,
+      primEcpm,
       opmcEcpm,
       totEcpm,
       Math.round(d.totalImps)
@@ -1526,11 +1640,15 @@ function downloadCsvFromSheet() {
 
   lines.push('');
   lines.push('Daily Revenue Trends');
-  lines.push('Date,Ad Unit Name,Ad Exchange Revenue (' + curr + '),OPMC Revenue (' + curr + '),Total Revenue (' + curr + '),Total Impressions');
+  lines.push('Date,Ad Unit Name,Assigned Parent Ad Unit,Demand Channel,Primary Programmatic Revenue (' + curr + '),OPMC Revenue (' + curr + '),Total Revenue (' + curr + '),Total Impressions');
   (cached.ad_unit_rows || []).forEach(function(r) {
+    const mappedParent = childToParent[r.ad_unit] || r.parent_ad_unit || '';
+    const assignedParent = mappedParent !== r.ad_unit ? mappedParent : '';
     lines.push([
-      r.date,
+      formatCsvDateOnly_(r.date, r.raw_date),
       '"' + String(r.ad_unit || '').replace(/"/g, '""') + '"',
+      '"' + String(assignedParent).replace(/"/g, '""') + '"',
+      '"' + String(r.demand_channel || 'Ad Exchange').replace(/"/g, '""') + '"',
       r.adx_revenue,
       r.opmc_revenue,
       r.total_revenue,
@@ -1540,11 +1658,12 @@ function downloadCsvFromSheet() {
 
   lines.push('');
   lines.push('Country Revenue Breakdown');
-  lines.push('Date,Country,Ad Exchange Revenue (' + curr + '),OPMC Revenue (' + curr + '),Total Revenue (' + curr + '),Total Impressions');
+  lines.push('Date,Country,Demand Channel,Primary Programmatic Revenue (' + curr + '),OPMC Revenue (' + curr + '),Total Revenue (' + curr + '),Total Impressions');
   (cached.country_rows || []).forEach(function(r) {
     lines.push([
-      r.date,
+      formatCsvDateOnly_(r.date, r.raw_date),
       '"' + String(r.country || '').replace(/"/g, '""') + '"',
+      '"' + String(r.demand_channel || 'Ad Exchange').replace(/"/g, '""') + '"',
       r.adx_revenue,
       r.opmc_revenue,
       r.total_revenue,
@@ -1617,6 +1736,7 @@ function readParamsFromDashboardSheet_() {
     network_code: '',
     start_date: '',
     end_date: '',
+    ad_unit_filter: '',
     api_mode: 'PUBLIC',
     quota_project: '',
     custom_token: ''
@@ -1631,6 +1751,12 @@ function readParamsFromDashboardSheet_() {
 
     const rawNetCode = String(dash.getRange('C7').getDisplayValue() || '').trim();
     const netCode = rawNetCode.toUpperCase() === '<INSERT_HERE>' ? '' : rawNetCode;
+    const b8Label = String(dash.getRange('B8').getDisplayValue() || '').toUpperCase();
+    let rawAdUnitFilter = '';
+    if (b8Label.indexOf('FILTER') !== -1 || !dash.getRange('C7:C8').isPartOfMerge()) {
+      rawAdUnitFilter = String(dash.getRange('C8').getDisplayValue() || '').trim();
+    }
+    const cleanAdUnitFilter = normalizeAdUnitFilter_(rawAdUnitFilter);
     const startVal = readDateCellIso_(dash.getRange('F7'), ss);
     const e8Label = String(dash.getRange('E8').getDisplayValue() || '').toUpperCase();
     const isStackedDatesLayout = e8Label.indexOf('END') !== -1;
@@ -1671,6 +1797,7 @@ function readParamsFromDashboardSheet_() {
       network_code: netCode,
       start_date: startVal,
       end_date: endVal,
+      ad_unit_filter: cleanAdUnitFilter,
       api_mode: apiMode,
       quota_project: resolvedQuotaProject,
       custom_token: ''
@@ -1852,7 +1979,63 @@ function extractVal_(vDict) {
       return k === 'intValue' ? parseInt(vDict[k], 10) : vDict[k];
     }
   }
+  if (vDict.stringListValue && Array.isArray(vDict.stringListValue.values)) {
+    let vals = vDict.stringListValue.values
+      .map(function(x) { return String(x || '').trim(); })
+      .filter(Boolean);
+    if (vals.length > 1 && vals[0].toLowerCase() === 'default') {
+      vals = vals.slice(1);
+    }
+    return vals.length > 0 ? vals.join(' » ') : null;
+  }
   return null;
+}
+
+/**
+ * Extracts the ordered [parent, ..., leaf] ad unit path from AD_UNIT_NAME_ALL_LEVEL.
+ */
+function extractAdUnitHierarchy_(vDict) {
+  if (!vDict || typeof vDict !== 'object') return ['All'];
+  if (vDict.stringListValue && Array.isArray(vDict.stringListValue.values)) {
+    let vals = vDict.stringListValue.values
+      .map(function(x) { return String(x || '').trim(); })
+      .filter(Boolean);
+    if (vals.length > 1 && vals[0].toLowerCase() === 'default') {
+      vals = vals.slice(1);
+    }
+    if (vals.length > 0) return vals;
+  }
+  const rawVal = extractVal_(vDict);
+  if (rawVal === null || rawVal === undefined) return ['All'];
+  const text = String(rawVal).trim();
+  if (!text) return ['All'];
+  let parts = text
+    .split(' » ')
+    .map(function(p) { return p.trim(); })
+    .filter(Boolean);
+  if (parts.length > 1 && parts[0].toLowerCase() === 'default') {
+    parts = parts.slice(1);
+  }
+  return parts.length > 0 ? parts : ['All'];
+}
+
+/**
+ * Normalizes an optional ad unit substring filter, ignoring blank/ALL/<INSERT_HERE> placeholders.
+ */
+function normalizeAdUnitFilter_(rawFilter) {
+  const val = String(rawFilter || '').trim();
+  const upper = val.toUpperCase();
+  if (!val || upper === 'ALL' || upper === '<INSERT_HERE>') return '';
+  return val;
+}
+
+/**
+ * Returns true if an ad unit name carries an explicit OPMC or mc1..mcN marker.
+ */
+function isOpmcUnitName_(name) {
+  const lower = String(name || '').toLowerCase();
+  if (lower.indexOf('opmc') !== -1 || lower.indexOf('multicall') !== -1) return true;
+  return /(?:^|[\s_|/-])mc\d+(?:$|[\s_|/-])/.test(lower);
 }
 
 /**
@@ -1898,15 +2081,26 @@ function tokenizeAdUnitForParentMatch_(name) {
   s = s.replace(/([a-z])([A-Z])/g, '$1 $2');
   s = s.replace(/([A-Z]+)([A-Z][a-z])/g, '$1 $2');
   const raw = s.split(/[^a-zA-Z0-9]+/).filter(Boolean).map(function(t) { return t.toLowerCase(); });
-  const core = raw.filter(function(t) {
-    if (FORMAT_AND_NOISE_WORDS[t]) return false;
+  const base = raw.filter(function(t) {
+    if (NOISE_WORDS[t]) return false;
     if (/^\d+$/.test(t)) return false;
     if (/^\d+x\d+$/.test(t)) return false;
+    if (/^(?:op)?mc\d+$/.test(t)) return false;
     return true;
+  });
+  const withoutFmt = base.filter(function(t) { return !FORMAT_WORDS[t]; });
+  const hasSpecificPlacement = withoutFmt.some(function(t) { return !PLATFORM_WORDS[t]; });
+  const core = hasSpecificPlacement ? withoutFmt : base;
+  const formats = {};
+  base.forEach(function(t) {
+    if (FORMAT_WORDS[t]) formats[t] = true;
   });
   return {
     tokens: core,
-    joined: core.join('')
+    baseTokens: base,
+    joined: core.join(''),
+    formats: formats,
+    isFormatLevel: !hasSpecificPlacement
   };
 }
 
@@ -1936,12 +2130,27 @@ function compareOpmcChildUnitsNaturally_(a, b) {
  */
 function buildParentAdUnitRollup_(adUnitRows) {
   const unitAgg = {};
+  const unitAncestors = {};
+  const manualOverrides = {};
   (adUnitRows || []).forEach(function(r) {
     const u = String(r.ad_unit || '').trim();
     if (!u) return;
     if (!unitAgg[u]) {
       unitAgg[u] = { adxRev: 0, opmcRev: 0, totRev: 0, adxImps: 0, opmcImps: 0, totImps: 0 };
     }
+    if (r.manual_parent && String(r.manual_parent).trim()) {
+      manualOverrides[u] = String(r.manual_parent).trim();
+    }
+    let ancList = [];
+    if (Array.isArray(r.ancestors) && r.ancestors.length > 0) {
+      ancList = r.ancestors.map(function(x) { return String(x || '').trim(); }).filter(Boolean);
+    } else if (r.parent_ad_unit && String(r.parent_ad_unit).trim()) {
+      ancList = String(r.parent_ad_unit).split(' » ').map(function(x) { return x.trim(); }).filter(Boolean);
+    }
+    if (ancList.length > 0 && (!unitAncestors[u] || ancList.length > unitAncestors[u].length)) {
+      unitAncestors[u] = ancList;
+    }
+
     const ar = Number(r.adx_revenue) || 0;
     const or = Number(r.opmc_revenue) || 0;
     const tr = Number(r.total_revenue) || (ar + or);
@@ -1959,14 +2168,18 @@ function buildParentAdUnitRollup_(adUnitRows) {
   const allUnits = Object.keys(unitAgg);
   const parents = [];
   const children = [];
+  const parentSet = {};
+  const parentLowerMap = {};
 
   allUnits.forEach(function(u) {
     const v = unitAgg[u];
-    const isOpmc = u.toLowerCase().indexOf('opmc') !== -1 || v.opmcRev > 0 || v.opmcImps > 0;
+    const isOpmc = isOpmcUnitName_(u) || v.opmcRev > 0 || v.opmcImps > 0;
     if (isOpmc) {
       children.push(u);
     } else {
       parents.push(u);
+      parentSet[u] = true;
+      parentLowerMap[u.toLowerCase()] = u;
     }
   });
 
@@ -1975,19 +2188,55 @@ function buildParentAdUnitRollup_(adUnitRows) {
     const t = tokenizeAdUnitForParentMatch_(p);
     const tokMap = {};
     t.tokens.forEach(function(tok) { tokMap[tok] = true; });
+    const baseTokMap = {};
+    t.baseTokens.forEach(function(tok) { baseTokMap[tok] = true; });
     const lowerP = p.toLowerCase();
     parentInfo[p] = {
       tokens: t.tokens,
       tokenSet: tokMap,
+      baseTokens: t.baseTokens,
+      baseTokenSet: baseTokMap,
+      formats: t.formats,
       joined: t.joined,
       adxRev: unitAgg[p].adxRev,
-      isStagingOrDirect: lowerP.indexOf('staging') !== -1 || lowerP.indexOf('direct') !== -1
+      isStagingOrDirect:
+        lowerP.indexOf('staging') !== -1 ||
+        lowerP.indexOf('direct') !== -1 ||
+        lowerP.indexOf('fallback') !== -1 ||
+        lowerP.indexOf('dummy') !== -1 ||
+        lowerP.indexOf('fake') !== -1
     };
   });
 
+  function isCandidateBetter_(cand, best) {
+    for (let i = 0; i < cand.length; i++) {
+      if (cand[i] !== best[i]) return cand[i] > best[i];
+    }
+    return false;
+  }
+
   function matchChildToParent(cName) {
-    let stem = String(cName || '').replace(/^opmc[\s_|-]*/i, '');
+    if (manualOverrides[cName]) {
+      return manualOverrides[cName];
+    }
+    const ancs = unitAncestors[cName] || [];
+    if (ancs.length > 0) {
+      for (let idx = ancs.length; idx >= 1; idx--) {
+        for (let start = 0; start < idx; start++) {
+          const candidate = ancs.slice(start, idx).join(' » ');
+          if (parentSet[candidate]) return candidate;
+          const lowerMatch = parentLowerMap[candidate.toLowerCase()];
+          if (lowerMatch) return lowerMatch;
+        }
+      }
+      return ancs.join(' » ');
+    }
+
+    const leafParts = String(cName || '').split(' » ');
+    const leafOnly = leafParts[leafParts.length - 1].trim();
+    let stem = leafOnly.replace(/^opmc[\s_|-]*/i, '');
     stem = stem.replace(/[\s_|-]*\$\d+(?:\.\d+)?$/, '');
+    stem = stem.replace(/[\s_|-]*(?:op)?mc\d+$/i, '');
     stem = stem.replace(/[\s_|-]*\d+$/, '').trim();
     for (let i = 0; i < parents.length; i++) {
       if (parents[i].toLowerCase() === stem.toLowerCase()) {
@@ -1995,64 +2244,73 @@ function buildParentAdUnitRollup_(adUnitRows) {
       }
     }
 
-    const ct = tokenizeAdUnitForParentMatch_(cName);
+    const ct = tokenizeAdUnitForParentMatch_(leafOnly);
     if (!ct.tokens || ct.tokens.length === 0) {
-      return String(cName || '').replace(/[\s_|/-]*\$\d+(?:\.\d+)?$/, '').trim() + ' (Shared OPMC)';
+      return leafOnly.replace(/[\s_|/-]*\$\d+(?:\.\d+)?$/, '').trim() + ' (Shared OPMC)';
     }
 
     let bestP = null;
-    let bestExact = -1;
-    let bestRatio = -1;
-    let bestNotStaging = -1;
-    let bestAdxRev = -1;
+    let bestTuple = [-1, -1, -1, -1, -1];
+    const ctFmtKeys = Object.keys(ct.formats);
 
     for (let j = 0; j < parents.length; j++) {
       const p = parents[j];
       const pInfo = parentInfo[p];
-      if (!pInfo.tokens || pInfo.tokens.length === 0) continue;
+      const pToks = ct.isFormatLevel ? pInfo.baseTokens : pInfo.tokens;
+      const pSet = ct.isFormatLevel ? pInfo.baseTokenSet : pInfo.tokenSet;
+      if (!pToks || pToks.length === 0) continue;
+      const pJoined = pToks.join('');
 
       let exactCore = 0;
       let overlapRatio = 0;
 
-      if (ct.joined === pInfo.joined) {
+      if (ct.joined === pJoined) {
         exactCore = 2;
         overlapRatio = 1.0;
       } else {
         let common = 0;
         for (let k = 0; k < ct.tokens.length; k++) {
-          if (pInfo.tokenSet[ct.tokens[k]]) common++;
+          if (pSet[ct.tokens[k]]) common++;
         }
-        const minJoinedLen = Math.min(ct.joined.length, pInfo.joined.length);
+        const minJoinedLen = Math.min(ct.joined.length, pJoined.length);
         if (
           common === 0 &&
           minJoinedLen >= 5 &&
-          (ct.joined.indexOf(pInfo.joined) !== -1 || pInfo.joined.indexOf(ct.joined) !== -1)
+          (ct.joined.indexOf(pJoined) !== -1 || pJoined.indexOf(ct.joined) !== -1)
         ) {
           exactCore = 1;
           overlapRatio = 0.85;
         } else {
           if (common === 0) continue;
           const childCov = common / ct.tokens.length;
-          const parentCov = common / pInfo.tokens.length;
+          const parentCov = common / pToks.length;
           if (childCov < 1.0) continue;
-          overlapRatio = Math.round((childCov * 0.7 + parentCov * 0.3) * 10000) / 10000;
+          overlapRatio = ct.isFormatLevel
+            ? 1.0
+            : Math.round((childCov * 0.7 + parentCov * 0.3) * 10000) / 10000;
           exactCore = childCov === 1.0 && parentCov === 1.0 ? 1 : 0;
         }
       }
 
-      const notStaging = pInfo.isStagingOrDirect ? 0 : 1;
-      const adxRev = pInfo.adxRev;
+      const pFmtKeys = Object.keys(pInfo.formats);
+      let fmtCompat = 0;
+      if (ctFmtKeys.length === 0 || pFmtKeys.length === 0) {
+        fmtCompat = 2;
+      } else {
+        const isSubset = ctFmtKeys.every(function(f) { return Boolean(pInfo.formats[f]); });
+        if (isSubset && ctFmtKeys.length === pFmtKeys.length) {
+          fmtCompat = 2;
+        } else if (isSubset) {
+          fmtCompat = 1;
+        } else {
+          fmtCompat = 0;
+        }
+      }
 
-      if (
-        exactCore > bestExact ||
-        (exactCore === bestExact && overlapRatio > bestRatio) ||
-        (exactCore === bestExact && overlapRatio === bestRatio && notStaging > bestNotStaging) ||
-        (exactCore === bestExact && overlapRatio === bestRatio && notStaging === bestNotStaging && adxRev > bestAdxRev)
-      ) {
-        bestExact = exactCore;
-        bestRatio = overlapRatio;
-        bestNotStaging = notStaging;
-        bestAdxRev = adxRev;
+      const notStaging = pInfo.isStagingOrDirect ? 0 : 1;
+      const candTuple = [fmtCompat, exactCore, overlapRatio, notStaging, pInfo.adxRev];
+      if (isCandidateBetter_(candTuple, bestTuple)) {
+        bestTuple = candTuple;
         bestP = p;
       }
     }
@@ -2064,9 +2322,11 @@ function buildParentAdUnitRollup_(adUnitRows) {
   parents.forEach(function(p) {
     parentGroups[p] = { children: [] };
   });
+  const childToParent = {};
   children.sort(compareOpmcChildUnitsNaturally_);
   children.forEach(function(c) {
     const p = matchChildToParent(c);
+    childToParent[c] = p;
     if (!parentGroups[p]) {
       parentGroups[p] = { children: [] };
     }
@@ -2159,6 +2419,7 @@ function buildParentAdUnitRollup_(adUnitRows) {
   return {
     parentRows: parentRows,
     detailRows: detailRows,
+    childToParent: childToParent,
     totalParents: parents.length,
     totalChildren: children.length
   };
@@ -2198,32 +2459,16 @@ function writeParentAdUnitBreakdownSheet_(ss, data) {
     grid.push(['', '', '', '', '', '', '', '', '', '']);
   }
 
-  let existingTop = null;
-  try {
-    if (sheet.getLastRow() >= 10) {
-      existingTop = sheet.getRange(1, 1, 10, 10).getValues();
-    }
-  } catch (e) {}
-
-  if (existingTop && existingTop.length === 10) {
-    // Keep existing header cells in rows 1 to 10.
-    for (let r = 0; r < 10; r++) {
-      for (let c = 0; c < 10; c++) {
-        grid[r][c] = existingTop[r][c] !== undefined ? existingTop[r][c] : '';
-      }
-    }
-  } else {
-    grid[1][1] = 'Parent Ad Unit Revenue Breakdown';
-    grid[3][1] =
-      'Table 1 combines Ad Exchange revenue for each Parent Ad Unit (A) with OPMC revenue from its Child Ad Units (A1 to A4). Table 2 lists each ad unit and its assigned Parent Ad Unit. To change a parent group, edit Column D in Table 2 and Table 1 updates automatically.';
-    grid[5][1] = 'PARENT & OPMC INVENTORY';
-    grid[5][3] = 'TOTAL AD EXCHANGE REVENUE';
-    grid[5][5] = 'TOTAL OPMC REVENUE';
-    grid[5][7] = 'TOTAL UNIFIED REVENUE';
-    grid[7][1] = 'Automatic Hierarchy & Naming Match (A ↔ A1..An)';
-    grid[9][1] = '▎ Table 1: Parent Ad Unit Revenue Summary (Parent A + Associated OPMC Units A1..An)';
-    grid[9][7] = 'Live Formula Rollup from Table 2';
-  }
+  grid[1][1] = 'Parent Ad Unit Revenue Breakdown';
+  grid[3][1] =
+    'Table 1 combines Primary programmatic revenue (Ad Exchange, Open Bidding, and SDK Bidding) on each Parent Ad Unit (A) with OPMC revenue from its Child Ad Units (A1 to An). Table 2 lists each ad unit and its assigned Parent Ad Unit, updating automatically when you change the Demand Channel filter on Overview (cell I12) or edit Column D.';
+  grid[5][1] = 'PARENT & OPMC INVENTORY';
+  grid[5][3] = 'TOTAL PRIMARY REVENUE';
+  grid[5][5] = 'TOTAL OPMC REVENUE';
+  grid[5][7] = 'TOTAL UNIFIED REVENUE';
+  grid[7][1] = 'Automatic Hierarchy & Naming Match (A ↔ A1..An)';
+  grid[9][1] = '▎ Table 1: Parent Ad Unit Revenue Summary (Parent A + Associated OPMC Units A1..An)';
+  grid[9][7] = '="Channel: "&IF(OR(Overview!I12="ALL",Overview!I12=""),"All (AdX+OB+SDKB)",Overview!I12)&" • Live Rollup"';
 
   // Write summary formulas in rows 7 and 8.
   grid[6][1] = numParents + ' Parent Groups  •  ' + rollup.totalChildren + ' OPMC Units';
@@ -2231,16 +2476,16 @@ function writeParentAdUnitBreakdownSheet_(ss, data) {
   grid[6][5] = '=E' + t1TotalRow;
   grid[6][7] = '=F' + t1TotalRow;
 
-  grid[7][3] = '="AdX Share: "&TEXT(G' + t1TotalRow + ', "0.0%")';
+  grid[7][3] = '="Primary Share: "&TEXT(G' + t1TotalRow + ', "0.0%")';
   grid[7][5] = '="OPMC Share: "&TEXT(H' + t1TotalRow + ', "0.0%")';
-  grid[7][7] = '="OPMC Uplift over AdX: +"&TEXT(IF(D' + t1TotalRow + '>0, E' + t1TotalRow + '/D' + t1TotalRow + ', 0), "0.0%")';
+  grid[7][7] = '="OPMC Uplift over Primary: +"&TEXT(IF(D' + t1TotalRow + '>0, E' + t1TotalRow + '/D' + t1TotalRow + ', 0), "0.0%")';
 
   grid[t1HeaderRow - 1][1] = 'Parent Ad Unit (A)';
   grid[t1HeaderRow - 1][2] = 'Associated OPMC Child Units (A1..An)';
-  grid[t1HeaderRow - 1][3] = 'Ad Exchange Revenue';
+  grid[t1HeaderRow - 1][3] = 'Primary Revenue';
   grid[t1HeaderRow - 1][4] = 'OPMC Revenue (A1..An)';
   grid[t1HeaderRow - 1][5] = 'Total Unified Revenue';
-  grid[t1HeaderRow - 1][6] = 'AdX Share (%)';
+  grid[t1HeaderRow - 1][6] = 'Primary Share (%)';
   grid[t1HeaderRow - 1][7] = 'OPMC Share (%)';
   grid[t1HeaderRow - 1][8] = 'Total Impressions';
 
@@ -2278,28 +2523,30 @@ function writeParentAdUnitBreakdownSheet_(ss, data) {
   }
 
   // Write the section header and column headers for Table 2.
-  grid[t2SectionRow - 1][1] = '▎ Table 2: Detailed Parent → OPMC Child Breakdown & Mapping (A & Individual A1, A2, A3, A4 Units)';
+  grid[t2SectionRow - 1][1] = '▎ Table 2: Detailed Parent → OPMC Child Breakdown & Mapping (A & Individual A1..An Units)';
 
   grid[t2HeaderRow - 1][1] = 'Individual Ad Unit Name (A or A1..An)';
   grid[t2HeaderRow - 1][2] = 'Ad Unit Role';
   grid[t2HeaderRow - 1][3] = 'Assigned Parent Ad Unit (A)';
-  grid[t2HeaderRow - 1][4] = 'Ad Exchange Revenue';
+  grid[t2HeaderRow - 1][4] = 'Primary Revenue';
   grid[t2HeaderRow - 1][5] = 'OPMC Revenue';
   grid[t2HeaderRow - 1][6] = 'Total Revenue';
   grid[t2HeaderRow - 1][7] = 'OPMC Share (%)';
   grid[t2HeaderRow - 1][8] = 'Total Impressions';
 
+  const chCritExpr = 'IF(OR(Overview!$I$12="ALL",Overview!$I$12=""),"*",Overview!$I$12)';
   for (let j = 0; j < detailRows.length; j++) {
     const rNum = t2StartRow + j;
     const dr = detailRows[j];
+    const crit = gsCriteriaLiteral_(dr.rawUnit);
     grid[rNum - 1][1] = dr.displayUnit;
     grid[rNum - 1][2] = dr.role;
     grid[rNum - 1][3] = dr.assignedParent;
-    grid[rNum - 1][4] = dr.adxRev;
-    grid[rNum - 1][5] = dr.opmcRev;
+    grid[rNum - 1][4] = '=SUMIFS(Ad_Unit_Data!$D$2:$D, Ad_Unit_Data!$C$2:$C, "' + crit + '", Ad_Unit_Data!$K$2:$K, ' + chCritExpr + ')';
+    grid[rNum - 1][5] = '=SUMIFS(Ad_Unit_Data!$E$2:$E, Ad_Unit_Data!$C$2:$C, "' + crit + '", Ad_Unit_Data!$K$2:$K, ' + chCritExpr + ')';
     grid[rNum - 1][6] = '=E' + rNum + '+F' + rNum;
     grid[rNum - 1][7] = '=IF(G' + rNum + '>0, F' + rNum + '/G' + rNum + ', 0)';
-    grid[rNum - 1][8] = dr.totalImps;
+    grid[rNum - 1][8] = '=SUMIFS(Ad_Unit_Data!$I$2:$I, Ad_Unit_Data!$C$2:$C, "' + crit + '", Ad_Unit_Data!$K$2:$K, ' + chCritExpr + ')';
   }
 
   sheet.clearContents();
@@ -2417,11 +2664,102 @@ function writeParentAdUnitBreakdownSheet_(ss, data) {
  * Creates and runs the Ad Exchange and OPMC reports, waits for completion,
  * gets all result rows, and writes the combined data to the spreadsheet.
  */
+/**
+ * Builds GAM v1 report filters: settled DEMAND_CHANNEL IN + optional AD_UNIT_NAME_ALL_LEVEL CONTAINS.
+ */
+function buildReportFilters_(cleanAdUnitFilter) {
+  const filters = [{
+    fieldFilter: {
+      field: { dimension: 'DEMAND_CHANNEL' },
+      operation: 'IN',
+      values: SETTLED_DEMAND_CHANNELS.map(function(ch) {
+        return { stringValue: ch };
+      })
+    }
+  }];
+  if (cleanAdUnitFilter) {
+    filters.push({
+      fieldFilter: {
+        field: { dimension: 'AD_UNIT_NAME_ALL_LEVEL' },
+        operation: 'CONTAINS',
+        values: [{ stringValue: cleanAdUnitFilter }]
+      }
+    });
+  }
+  return filters;
+}
+
+/**
+ * Converts a UTC millisecond timestamp into a GAM API Date object and ISO string.
+ */
+function utcMsToDateInfo_(utcMs) {
+  const dt = new Date(utcMs);
+  const y = dt.getUTCFullYear();
+  const m = dt.getUTCMonth() + 1;
+  const d = dt.getUTCDate();
+  return {
+    str: y + '-' + ('0' + m).slice(-2) + '-' + ('0' + d).slice(-2),
+    obj: { year: y, month: m, day: d }
+  };
+}
+
+/**
+ * Splits a YYYY-MM-DD range into contiguous windows of at most maxChunkDays (default 62).
+ */
+function splitDateRangeChunks_(startDateStr, endDateStr, maxChunkDays) {
+  const chunkDays = Math.max(Number(maxChunkDays) || 62, 1);
+  const sObj = parseDateObj_(startDateStr);
+  const eObj = parseDateObj_(endDateStr);
+  const startMs = Date.UTC(sObj.year, sObj.month - 1, sObj.day);
+  const endMs = Date.UTC(eObj.year, eObj.month - 1, eObj.day);
+  if (endMs < startMs) {
+    throw new Error('Invalid Date Range: End Date (' + endDateStr + ') is before Start Date (' + startDateStr + ').');
+  }
+
+  const dayMs = 86400000;
+  const windows = [];
+  let curMs = startMs;
+  while (curMs <= endMs) {
+    const wEndMs = Math.min(endMs, curMs + (chunkDays - 1) * dayMs);
+    const sInfo = utcMsToDateInfo_(curMs);
+    const eInfo = utcMsToDateInfo_(wEndMs);
+    windows.push({
+      startMs: curMs,
+      endMs: wEndMs,
+      spanDays: Math.round((wEndMs - curMs) / dayMs),
+      startStr: sInfo.str,
+      endStr: eInfo.str,
+      startObj: sInfo.obj,
+      endObj: eInfo.obj
+    });
+    curMs = wEndMs + dayMs;
+  }
+  return windows;
+}
+
+/**
+ * Returns true if an API error message represents a transient or timeout failure.
+ */
+function isTransientReportError_(errText) {
+  const msg = String(errText || '');
+  return (
+    msg.indexOf('DEADLINE_EXCEEDED') !== -1 ||
+    msg.indexOf('UNAVAILABLE') !== -1 ||
+    msg.indexOf('INTERNAL') !== -1 ||
+    msg.indexOf('timed out') !== -1 ||
+    msg.indexOf('SERVER_ERROR') !== -1
+  );
+}
+
+/**
+ * Executes a wave of report window tasks (create -> run -> poll -> fetchRows) with bisection support.
+ */
 function runUnifiedReportPipeline(params) {
   const effectiveParams = params || readParamsFromDashboardSheet_();
   const networkCode = String(effectiveParams.network_code || '').trim();
   const startDateStr = String(effectiveParams.start_date || '').trim();
   const endDateStr = String(effectiveParams.end_date || '').trim();
+  const cleanAdUnitFilter = normalizeAdUnitFilter_(effectiveParams.ad_unit_filter);
 
   if (!networkCode) {
     throw new Error('Missing Network Code: Please enter your Google Ad Manager Network Code in cell C7 on the Overview tab.');
@@ -2431,39 +2769,43 @@ function runUnifiedReportPipeline(params) {
   }
 
   const apiConfig = resolveApiConfig_(effectiveParams);
-  const startObj = parseDateObj_(startDateStr);
-  const endObj = parseDateObj_(endDateStr);
+  const windows = splitDateRangeChunks_(startDateStr, endDateStr, 62);
   const baseUrl = apiConfig.baseUrl;
   const ts = new Date().getTime();
+  const commonFilters = buildReportFilters_(cleanAdUnitFilter);
 
   const reportSpecs = [
     {
       key: 'h_unit',
       reportType: 'HISTORICAL',
-      dimensions: ['DATE', 'AD_UNIT_NAME'],
-      metrics: ['AD_EXCHANGE_IMPRESSIONS', 'AD_EXCHANGE_REVENUE'],
-      expandedCompatibility: true
+      dimensions: ['DATE', 'AD_UNIT_NAME_ALL_LEVEL', 'DEMAND_CHANNEL'],
+      metrics: ['IMPRESSIONS', 'REVENUE_WITHOUT_CPD'],
+      expandedCompatibility: false,
+      filters: commonFilters
     },
     {
       key: 'o_unit',
       reportType: 'ON_PLATFORM_MULTICALL',
-      dimensions: ['DATE', 'AD_UNIT_NAME'],
+      dimensions: ['DATE', 'AD_UNIT_NAME_ALL_LEVEL', 'DEMAND_CHANNEL'],
       metrics: ['ON_PLATFORM_MULTIPLE_CALL_IMPRESSIONS', 'ON_PLATFORM_MULTIPLE_CALL_REVENUE'],
-      expandedCompatibility: false
+      expandedCompatibility: false,
+      filters: commonFilters
     },
     {
       key: 'h_country',
       reportType: 'HISTORICAL',
-      dimensions: ['DATE', 'COUNTRY_NAME'],
-      metrics: ['AD_EXCHANGE_IMPRESSIONS', 'AD_EXCHANGE_REVENUE'],
-      expandedCompatibility: true
+      dimensions: ['DATE', 'COUNTRY_NAME', 'DEMAND_CHANNEL'],
+      metrics: ['IMPRESSIONS', 'REVENUE_WITHOUT_CPD'],
+      expandedCompatibility: false,
+      filters: commonFilters
     },
     {
       key: 'o_country',
       reportType: 'ON_PLATFORM_MULTICALL',
-      dimensions: ['DATE', 'COUNTRY_NAME'],
+      dimensions: ['DATE', 'COUNTRY_NAME', 'DEMAND_CHANNEL'],
       metrics: ['ON_PLATFORM_MULTIPLE_CALL_IMPRESSIONS', 'ON_PLATFORM_MULTIPLE_CALL_REVENUE'],
-      expandedCompatibility: false
+      expandedCompatibility: false,
+      filters: commonFilters
     }
   ];
 
@@ -2487,102 +2829,177 @@ function runUnifiedReportPipeline(params) {
   }
   const currSymbol = CURRENCY_SYMBOLS[currencyCode] || (currencyCode + ' ');
 
-  const createUrl = baseUrl + '/networks/' + networkCode + '/reports';
-  const createRequests = reportSpecs.map(function(spec, idx) {
-    const reportDef = {
-      dimensions: spec.dimensions,
-      metrics: spec.metrics,
-      dateRange: {
-        fixed: {
-          startDate: startObj,
-          endDate: endObj
-        }
-      },
-      reportType: spec.reportType
-    };
-    if (spec.expandedCompatibility) {
-      reportDef.expandedCompatibility = true;
-    }
-    const payload = {
-      displayName: 'AppsScript_' + spec.reportType + '_' + idx + '_' + ts,
-      reportDefinition: reportDef
-    };
-    return buildFetchRequest_(createUrl, 'POST', payload, apiConfig);
-  });
-
-  const createdReports = executeBatchRequests_(createRequests, apiConfig, 3);
-  const reportNames = createdReports.map(function(r) {
-    if (!r || !r.name) {
-      throw new Error('Failed to create report: ' + JSON.stringify(r));
-    }
-    return r.name;
-  });
-
-  const runRequests = reportNames.map(function(reportName) {
-    return buildFetchRequest_(baseUrl + '/' + reportName + ':run', 'POST', {}, apiConfig);
-  });
-  let operations = executeBatchRequests_(runRequests, apiConfig, 3);
-
-  const maxPolls = 90;
-  for (let poll = 0; poll < maxPolls; poll++) {
-    const pendingIndices = [];
-    const pollRequests = [];
-    for (let i = 0; i < operations.length; i++) {
-      if (!operations[i].done) {
-        pendingIndices.push(i);
-        pollRequests.push(buildFetchRequest_(baseUrl + '/' + operations[i].name, 'GET', null, apiConfig));
-      }
-    }
-    if (pendingIndices.length === 0) break;
-    Utilities.sleep(2000);
-    const pollResponses = executeBatchRequests_(pollRequests, apiConfig, 3);
-    for (let j = 0; j < pendingIndices.length; j++) {
-      operations[pendingIndices[j]] = pollResponses[j];
-    }
-  }
-
-  const resultNames = operations.map(function(op, i) {
-    if (!op.done) {
-      throw new Error('Report operation timed out: ' + op.name);
-    }
-    if (op.error) {
-      throw new Error('Report operation failed: ' + JSON.stringify(op.error));
-    }
-    const respData = op.response || {};
-    const opParts = String(op.name || '').split('/');
-    const opId = opParts[opParts.length - 1];
-    return respData.reportResult || (reportNames[i] + '/results/' + opId);
+  const taskQueue = [];
+  windows.forEach(function(win, wIdx) {
+    reportSpecs.forEach(function(spec, specIdx) {
+      taskQueue.push({
+        specIdx: specIdx,
+        spec: spec,
+        startMs: win.startMs,
+        endMs: win.endMs,
+        startObj: win.startObj,
+        endObj: win.endObj,
+        tag: 'w' + wIdx,
+        attempt: 0
+      });
+    });
   });
 
   const allRowsByReport = [[], [], [], []];
-  let pageTokens = [null, null, null, null];
-  let activeReportIndices = [0, 1, 2, 3];
+  const createUrl = baseUrl + '/networks/' + networkCode + '/reports';
+  const maxPolls = 90;
+  const maxWaveSize = 16;
 
-  while (activeReportIndices.length > 0) {
-    const fetchRequests = activeReportIndices.map(function(idx) {
-      let fetchUrl = baseUrl + '/' + resultNames[idx] + ':fetchRows?pageSize=5000';
-      if (pageTokens[idx]) {
-        fetchUrl += '&pageToken=' + encodeURIComponent(pageTokens[idx]);
+  while (taskQueue.length > 0) {
+    const wave = taskQueue.splice(0, maxWaveSize);
+    const createRequests = wave.map(function(task, idx) {
+      const reportDef = {
+        dimensions: task.spec.dimensions,
+        metrics: task.spec.metrics,
+        dateRange: {
+          fixed: {
+            startDate: task.startObj,
+            endDate: task.endObj
+          }
+        },
+        reportType: task.spec.reportType
+      };
+      if (task.spec.expandedCompatibility) {
+        reportDef.expandedCompatibility = true;
       }
-      return buildFetchRequest_(fetchUrl, 'GET', null, apiConfig);
+      if (task.spec.filters && task.spec.filters.length > 0) {
+        reportDef.filters = task.spec.filters;
+      }
+      return buildFetchRequest_(
+        createUrl,
+        'POST',
+        {
+          displayName: 'AppsScript_' + task.spec.reportType + '_' + task.specIdx + '_' + task.tag + '_' + idx + '_' + ts,
+          reportDefinition: reportDef
+        },
+        apiConfig
+      );
     });
 
-    const pageResults = executeBatchRequests_(fetchRequests, apiConfig, 3);
-    const nextActive = [];
-
-    for (let k = 0; k < activeReportIndices.length; k++) {
-      const rIdx = activeReportIndices[k];
-      const resData = pageResults[k] || {};
-      const rows = resData.rows || [];
-      for (let r = 0; r < rows.length; r++) {
-        allRowsByReport[rIdx].push(rows[r]);
+    const createdReports = executeBatchRequests_(createRequests, apiConfig, 3);
+    const reportNames = createdReports.map(function(r) {
+      if (!r || !r.name) {
+        throw new Error('Failed to create report: ' + JSON.stringify(r));
       }
-      if (resData.nextPageToken) {
-        pageTokens[rIdx] = resData.nextPageToken;
-        nextActive.push(rIdx);
+      return r.name;
+    });
+
+    const runRequests = reportNames.map(function(reportName) {
+      return buildFetchRequest_(baseUrl + '/' + reportName + ':run', 'POST', {}, apiConfig);
+    });
+    const operations = executeBatchRequests_(runRequests, apiConfig, 3);
+
+    for (let poll = 0; poll < maxPolls; poll++) {
+      const pendingIndices = [];
+      const pollRequests = [];
+      for (let i = 0; i < operations.length; i++) {
+        if (!operations[i].done) {
+          pendingIndices.push(i);
+          pollRequests.push(buildFetchRequest_(baseUrl + '/' + operations[i].name, 'GET', null, apiConfig));
+        }
+      }
+      if (pendingIndices.length === 0) break;
+      Utilities.sleep(2000);
+      const pollResponses = executeBatchRequests_(pollRequests, apiConfig, 3);
+      for (let j = 0; j < pendingIndices.length; j++) {
+        operations[pendingIndices[j]] = pollResponses[j];
       }
     }
-    activeReportIndices = nextActive;
+
+    const completedTasks = [];
+    for (let i = 0; i < wave.length; i++) {
+      const task = wave[i];
+      const op = operations[i];
+      if (op && op.done && !op.error) {
+        const respData = op.response || {};
+        const opParts = String(op.name || '').split('/');
+        const opId = opParts[opParts.length - 1];
+        completedTasks.push({
+          task: task,
+          resultName: respData.reportResult || (reportNames[i] + '/results/' + opId),
+          pageToken: null
+        });
+      } else {
+        const errStr = op && op.error
+          ? JSON.stringify(op.error)
+          : ('Report operation timed out: ' + (op ? op.name : task.tag));
+        const dayMs = 86400000;
+        const spanDays = Math.round((task.endMs - task.startMs) / dayMs);
+        if (isTransientReportError_(errStr) && spanDays >= 7) {
+          const midMs = task.startMs + Math.floor(spanDays / 2) * dayMs;
+          const nextMs = midMs + dayMs;
+          const leftEnd = utcMsToDateInfo_(midMs);
+          const rightStart = utcMsToDateInfo_(nextMs);
+          taskQueue.unshift(
+            {
+              specIdx: task.specIdx,
+              spec: task.spec,
+              startMs: task.startMs,
+              endMs: midMs,
+              startObj: task.startObj,
+              endObj: leftEnd.obj,
+              tag: task.tag + 'a',
+              attempt: 0
+            },
+            {
+              specIdx: task.specIdx,
+              spec: task.spec,
+              startMs: nextMs,
+              endMs: task.endMs,
+              startObj: rightStart.obj,
+              endObj: task.endObj,
+              tag: task.tag + 'b',
+              attempt: 0
+            }
+          );
+        } else if (isTransientReportError_(errStr) && task.attempt < 2) {
+          Utilities.sleep(2000 * (task.attempt + 1));
+          taskQueue.unshift({
+            specIdx: task.specIdx,
+            spec: task.spec,
+            startMs: task.startMs,
+            endMs: task.endMs,
+            startObj: task.startObj,
+            endObj: task.endObj,
+            tag: task.tag,
+            attempt: task.attempt + 1
+          });
+        } else {
+          throw new Error('Report operation failed (' + task.spec.key + '): ' + errStr);
+        }
+      }
+    }
+
+    let activeFetch = completedTasks;
+    while (activeFetch.length > 0) {
+      const fetchRequests = activeFetch.map(function(entry) {
+        let fetchUrl = baseUrl + '/' + entry.resultName + ':fetchRows?pageSize=5000';
+        if (entry.pageToken) {
+          fetchUrl += '&pageToken=' + encodeURIComponent(entry.pageToken);
+        }
+        return buildFetchRequest_(fetchUrl, 'GET', null, apiConfig);
+      });
+      const pageResults = executeBatchRequests_(fetchRequests, apiConfig, 3);
+      const nextActive = [];
+      for (let k = 0; k < activeFetch.length; k++) {
+        const entry = activeFetch[k];
+        const resData = pageResults[k] || {};
+        const rows = resData.rows || [];
+        for (let r = 0; r < rows.length; r++) {
+          allRowsByReport[entry.task.specIdx].push(rows[r]);
+        }
+        if (resData.nextPageToken) {
+          entry.pageToken = resData.nextPageToken;
+          nextActive.push(entry);
+        }
+      }
+      activeFetch = nextActive;
+    }
   }
 
   const output = aggregateStreams_(
@@ -2600,6 +3017,7 @@ function runUnifiedReportPipeline(params) {
       network_code: networkCode,
       start_date: startDateStr,
       end_date: endDateStr,
+      ad_unit_filter: cleanAdUnitFilter,
       api_mode: params && params.api_mode,
       quota_project: apiConfig.quotaProject
     });
@@ -2611,36 +3029,81 @@ function runUnifiedReportPipeline(params) {
 }
 
 /**
- * Combines the Ad Exchange and OPMC report rows by date, ad unit, and country.
+ * Combines the Primary Programmatic and OPMC report rows by date, ad unit, country, and demand channel.
  */
 function aggregateStreams_(currencyCode, currSymbol, rawHUnit, rawOUnit, rawHCountry, rawOCountry, modeLabel) {
-  const adUnitDict = {};
+  const rawAdUnitDict = {};
+  const leafToPaths = {};
 
   function addAdUnitRow(r, isOpmc) {
-    const dimVals = (r.dimensionValues || []).map(extractVal_);
-    const date = dimVals.length > 0 && dimVals[0] !== null ? String(dimVals[0]) : 'All';
-    const adUnit = dimVals.length > 1 && dimVals[1] !== null ? String(dimVals[1]) : 'All';
+    const rawDims = r.dimensionValues || [];
+    const dateVal = rawDims.length > 0 ? extractVal_(rawDims[0]) : null;
+    const date = dateVal !== null ? String(dateVal) : 'All';
+    const pathList = rawDims.length > 1 ? extractAdUnitHierarchy_(rawDims[1]) : ['All'];
+    const pathKey = pathList.join(' » ');
+    const leaf = pathList[pathList.length - 1];
+    if (!leafToPaths[leaf]) leafToPaths[leaf] = {};
+    leafToPaths[leaf][pathKey] = true;
+    const rawCh = rawDims.length > 2 ? extractVal_(rawDims[2]) : 'AD_EXCHANGE';
+    const demandChannel = normalizeDemandChannel_(rawCh);
 
     const metricGroups = r.metricValueGroups || [];
     const mets = metricGroups.length > 0 ? (metricGroups[0].primaryValues || []).map(extractVal_) : [0, 0];
     const imps = mets.length > 0 && mets[0] !== null ? Number(mets[0]) : 0.0;
     const rev = mets.length > 1 && mets[1] !== null ? Number(mets[1]) : 0.0;
 
-    const key = date + '|||' + adUnit;
-    if (!adUnitDict[key]) {
-      adUnitDict[key] = { date: date, ad_unit: adUnit, adx_rev: 0.0, opmc_rev: 0.0, adx_imps: 0.0, opmc_imps: 0.0 };
+    const key = date + '|||' + pathKey + '|||' + demandChannel;
+    if (!rawAdUnitDict[key]) {
+      rawAdUnitDict[key] = {
+        date: date,
+        path: pathList,
+        demand_channel: demandChannel,
+        adx_rev: 0.0,
+        opmc_rev: 0.0,
+        adx_imps: 0.0,
+        opmc_imps: 0.0
+      };
     }
     if (isOpmc) {
-      adUnitDict[key].opmc_rev += rev;
-      adUnitDict[key].opmc_imps += imps;
+      rawAdUnitDict[key].opmc_rev += rev;
+      rawAdUnitDict[key].opmc_imps += imps;
     } else {
-      adUnitDict[key].adx_rev += rev;
-      adUnitDict[key].adx_imps += imps;
+      rawAdUnitDict[key].adx_rev += rev;
+      rawAdUnitDict[key].adx_imps += imps;
     }
   }
 
   (rawHUnit || []).forEach(function(r) { addAdUnitRow(r, false); });
   (rawOUnit || []).forEach(function(r) { addAdUnitRow(r, true); });
+
+  const adUnitDict = {};
+  Object.keys(rawAdUnitDict).forEach(function(rawKey) {
+    const item = rawAdUnitDict[rawKey];
+    const pathList = item.path;
+    const leaf = pathList[pathList.length - 1];
+    const ancestors = pathList.slice(0, pathList.length - 1);
+    const hasCollision = Object.keys(leafToPaths[leaf] || {}).length > 1;
+    const adUnitDisplay = hasCollision ? pathList.join(' » ') : leaf;
+    const demandChannel = item.demand_channel;
+    const key = item.date + '|||' + adUnitDisplay + '|||' + demandChannel;
+    if (!adUnitDict[key]) {
+      adUnitDict[key] = {
+        date: item.date,
+        ad_unit: adUnitDisplay,
+        ancestors: ancestors,
+        parent_ad_unit: ancestors.join(' » '),
+        demand_channel: demandChannel,
+        adx_rev: 0.0,
+        opmc_rev: 0.0,
+        adx_imps: 0.0,
+        opmc_imps: 0.0
+      };
+    }
+    adUnitDict[key].adx_rev += item.adx_rev;
+    adUnitDict[key].opmc_rev += item.opmc_rev;
+    adUnitDict[key].adx_imps += item.adx_imps;
+    adUnitDict[key].opmc_imps += item.opmc_imps;
+  });
 
   const countryDict = {};
 
@@ -2648,15 +3111,25 @@ function aggregateStreams_(currencyCode, currSymbol, rawHUnit, rawOUnit, rawHCou
     const dimVals = (r.dimensionValues || []).map(extractVal_);
     const date = dimVals.length > 0 && dimVals[0] !== null ? String(dimVals[0]) : 'All';
     const country = dimVals.length > 1 && dimVals[1] !== null ? String(dimVals[1]) : 'Unknown';
+    const rawCh = dimVals.length > 2 && dimVals[2] !== null ? dimVals[2] : 'AD_EXCHANGE';
+    const demandChannel = normalizeDemandChannel_(rawCh);
 
     const metricGroups = r.metricValueGroups || [];
     const mets = metricGroups.length > 0 ? (metricGroups[0].primaryValues || []).map(extractVal_) : [0, 0];
     const imps = mets.length > 0 && mets[0] !== null ? Number(mets[0]) : 0.0;
     const rev = mets.length > 1 && mets[1] !== null ? Number(mets[1]) : 0.0;
 
-    const key = date + '|||' + country;
+    const key = date + '|||' + country + '|||' + demandChannel;
     if (!countryDict[key]) {
-      countryDict[key] = { date: date, country: country, adx_rev: 0.0, opmc_rev: 0.0, adx_imps: 0.0, opmc_imps: 0.0 };
+      countryDict[key] = {
+        date: date,
+        country: country,
+        demand_channel: demandChannel,
+        adx_rev: 0.0,
+        opmc_rev: 0.0,
+        adx_imps: 0.0,
+        opmc_imps: 0.0
+      };
     }
     if (isOpmc) {
       countryDict[key].opmc_rev += rev;
@@ -2689,6 +3162,7 @@ function aggregateStreams_(currencyCode, currSymbol, rawHUnit, rawOUnit, rawHCou
     const adxImp = val.adx_imps;
     const opmcImp = val.opmc_imps;
     const totImp = adxImp + opmcImp;
+    const demandChannel = val.demand_channel || 'Ad Exchange';
 
     totalAdxRev += adxRev;
     totalOpmcRev += opmcRev;
@@ -2697,7 +3171,20 @@ function aggregateStreams_(currencyCode, currSymbol, rawHUnit, rawOUnit, rawHCou
 
     const cleanD = String(val.date).trim();
     if (!dailyDict[cleanD]) {
-      dailyDict[cleanD] = { adx: 0.0, opmc: 0.0, tot: 0.0, adx_imps: 0.0, opmc_imps: 0.0, tot_imps: 0.0 };
+      dailyDict[cleanD] = {
+        adx: 0.0,
+        opmc: 0.0,
+        tot: 0.0,
+        adx_imps: 0.0,
+        opmc_imps: 0.0,
+        tot_imps: 0.0,
+        opmc_adx: 0.0,
+        opmc_ob: 0.0,
+        opmc_sdkb: 0.0,
+        prim_adx: 0.0,
+        prim_ob: 0.0,
+        prim_sdkb: 0.0
+      };
     }
     dailyDict[cleanD].adx += adxRev;
     dailyDict[cleanD].opmc += opmcRev;
@@ -2705,6 +3192,16 @@ function aggregateStreams_(currencyCode, currSymbol, rawHUnit, rawOUnit, rawHCou
     dailyDict[cleanD].adx_imps += adxImp;
     dailyDict[cleanD].opmc_imps += opmcImp;
     dailyDict[cleanD].tot_imps += totImp;
+    if (demandChannel === 'Ad Exchange') {
+      dailyDict[cleanD].opmc_adx += opmcRev;
+      dailyDict[cleanD].prim_adx += adxRev;
+    } else if (demandChannel === 'Open Bidding') {
+      dailyDict[cleanD].opmc_ob += opmcRev;
+      dailyDict[cleanD].prim_ob += adxRev;
+    } else if (demandChannel === 'SDK Bidding') {
+      dailyDict[cleanD].opmc_sdkb += opmcRev;
+      dailyDict[cleanD].prim_sdkb += adxRev;
+    }
 
     if (val.ad_unit) adUnitSet[val.ad_unit] = true;
 
@@ -2712,6 +3209,9 @@ function aggregateStreams_(currencyCode, currSymbol, rawHUnit, rawOUnit, rawHCou
       date: formatDateLabel_(cleanD),
       raw_date: cleanD,
       ad_unit: val.ad_unit,
+      parent_ad_unit: val.parent_ad_unit || '',
+      ancestors: val.ancestors || [],
+      demand_channel: demandChannel,
       adx_revenue: Math.round(adxRev * 100) / 100,
       opmc_revenue: Math.round(opmcRev * 100) / 100,
       total_revenue: Math.round(totRev * 100) / 100,
@@ -2739,6 +3239,7 @@ function aggregateStreams_(currencyCode, currSymbol, rawHUnit, rawOUnit, rawHCou
       date: formatDateLabel_(cleanD),
       raw_date: cleanD,
       country: val.country,
+      demand_channel: val.demand_channel || 'Ad Exchange',
       adx_revenue: Math.round(adxRev * 100) / 100,
       opmc_revenue: Math.round(opmcRev * 100) / 100,
       total_revenue: Math.round(totRev * 100) / 100,
@@ -2766,6 +3267,19 @@ function aggregateStreams_(currencyCode, currSymbol, rawHUnit, rawOUnit, rawHCou
   const dailyAdxImps = sortedDates.map(function(d) { return Math.round(dailyDict[d].adx_imps); });
   const dailyOpmcImps = sortedDates.map(function(d) { return Math.round(dailyDict[d].opmc_imps); });
   const dailyTotalImps = sortedDates.map(function(d) { return Math.round(dailyDict[d].tot_imps); });
+  const dailyOpmcAdx = sortedDates.map(function(d) { return Math.round(dailyDict[d].opmc_adx * 100) / 100; });
+  const dailyOpmcOb = sortedDates.map(function(d) { return Math.round(dailyDict[d].opmc_ob * 100) / 100; });
+  const dailyOpmcSdkb = sortedDates.map(function(d) { return Math.round(dailyDict[d].opmc_sdkb * 100) / 100; });
+  const dailyPrimAdx = sortedDates.map(function(d) { return Math.round(dailyDict[d].prim_adx * 100) / 100; });
+  const dailyPrimOb = sortedDates.map(function(d) { return Math.round(dailyDict[d].prim_ob * 100) / 100; });
+  const dailyPrimSdkb = sortedDates.map(function(d) { return Math.round(dailyDict[d].prim_sdkb * 100) / 100; });
+
+  const rollupPreview = buildParentAdUnitRollup_(adUnitRows);
+  const childToParent = rollupPreview.childToParent || {};
+  (rollupPreview.parentRows || []).forEach(function(pr) {
+    const pName = String(pr.parentName || '').trim();
+    if (pName) adUnitSet[pName] = true;
+  });
 
   const allAdUnits = Object.keys(adUnitSet).sort();
   const allCountries = Object.keys(countrySet).sort();
@@ -2784,6 +3298,7 @@ function aggregateStreams_(currencyCode, currSymbol, rawHUnit, rawOUnit, rawHCou
     api_mode_label: modeLabel,
     currency_code: currencyCode,
     currency_symbol: currSymbol,
+    child_to_parent: childToParent,
     summary: {
       currency_code: currencyCode,
       currency_symbol: currSymbol,
@@ -2806,7 +3321,13 @@ function aggregateStreams_(currencyCode, currSymbol, rawHUnit, rawOUnit, rawHCou
       total: dailyTotal,
       adx_impressions: dailyAdxImps,
       opmc_impressions: dailyOpmcImps,
-      total_impressions: dailyTotalImps
+      total_impressions: dailyTotalImps,
+      opmc_adx: dailyOpmcAdx,
+      opmc_ob: dailyOpmcOb,
+      opmc_sdkb: dailyOpmcSdkb,
+      prim_adx: dailyPrimAdx,
+      prim_ob: dailyPrimOb,
+      prim_sdkb: dailyPrimSdkb
     },
     ad_units: allAdUnits,
     countries: allCountries,
@@ -2823,53 +3344,69 @@ function writeResultsToSheets_(data, params) {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   if (!ss) return;
 
-  let unitSheet = ss.getSheetByName('Ad_Unit_Data') || ss.insertSheet('Ad_Unit_Data');
+  try {
+    upgradeToV13LayoutIfNeeded_(ss, data.currency_symbol || '$');
+  } catch (upgErr) {}
+
+  const childToParent = data.child_to_parent || (buildParentAdUnitRollup_(data.ad_unit_rows || []).childToParent || {});
+
+  const unitSheet = ss.getSheetByName('Ad_Unit_Data') || ss.insertSheet('Ad_Unit_Data');
   unitSheet.clearContents();
+  if (unitSheet.getMaxColumns() < 11) {
+    unitSheet.insertColumnsAfter(unitSheet.getMaxColumns(), 11 - unitSheet.getMaxColumns());
+  }
   const unitHeader = [[
-    'Date', 'Raw_Date', 'Ad_Unit', 'AdX_Revenue', 'OPMC_Revenue', 'Total_Revenue',
-    'AdX_Impressions', 'OPMC_Impressions', 'Total_Impressions'
+    'Date', 'Raw_Date', 'Ad_Unit', 'Primary_Revenue', 'OPMC_Revenue', 'Total_Revenue',
+    'Primary_Impressions', 'OPMC_Impressions', 'Total_Impressions', 'Parent_Ad_Unit', 'Demand_Channel'
   ]];
   const unitValues = (data.ad_unit_rows || []).map(function(r) {
+    let resolvedParent = childToParent[r.ad_unit] || '';
+    if (resolvedParent === r.ad_unit) resolvedParent = '';
     return [
       r.date, r.raw_date, r.ad_unit, r.adx_revenue, r.opmc_revenue, r.total_revenue,
-      r.adx_impressions || 0, r.opmc_impressions || 0, r.total_impressions
+      r.adx_impressions || 0, r.opmc_impressions || 0, r.total_impressions, resolvedParent, r.demand_channel || 'Ad Exchange'
     ];
   });
   const allUnitRows = unitHeader.concat(unitValues);
   if (unitSheet.getMaxRows() < allUnitRows.length + 5) {
     unitSheet.insertRowsAfter(unitSheet.getMaxRows(), allUnitRows.length + 5 - unitSheet.getMaxRows());
   }
-  unitSheet.getRange(1, 1, allUnitRows.length, 9).setValues(allUnitRows);
+  unitSheet.getRange(1, 1, allUnitRows.length, 11).setValues(allUnitRows);
 
-  let countrySheet = ss.getSheetByName('Country_Data') || ss.insertSheet('Country_Data');
+  const countrySheet = ss.getSheetByName('Country_Data') || ss.insertSheet('Country_Data');
   countrySheet.clearContents();
+  if (countrySheet.getMaxColumns() < 10) {
+    countrySheet.insertColumnsAfter(countrySheet.getMaxColumns(), 10 - countrySheet.getMaxColumns());
+  }
   const countryHeader = [[
-    'Date', 'Raw_Date', 'Country', 'AdX_Revenue', 'OPMC_Revenue', 'Total_Revenue',
-    'AdX_Impressions', 'OPMC_Impressions', 'Total_Impressions'
+    'Date', 'Raw_Date', 'Country', 'Primary_Revenue', 'OPMC_Revenue', 'Total_Revenue',
+    'Primary_Impressions', 'OPMC_Impressions', 'Total_Impressions', 'Demand_Channel'
   ]];
   const countryValues = (data.country_rows || []).map(function(r) {
     return [
       r.date, r.raw_date, r.country, r.adx_revenue, r.opmc_revenue, r.total_revenue,
-      r.adx_impressions || 0, r.opmc_impressions || 0, r.total_impressions
+      r.adx_impressions || 0, r.opmc_impressions || 0, r.total_impressions, r.demand_channel || 'Ad Exchange'
     ];
   });
   const allCountryRows = countryHeader.concat(countryValues);
   if (countrySheet.getMaxRows() < allCountryRows.length + 5) {
     countrySheet.insertRowsAfter(countrySheet.getMaxRows(), allCountryRows.length + 5 - countrySheet.getMaxRows());
   }
-  countrySheet.getRange(1, 1, allCountryRows.length, 9).setValues(allCountryRows);
+  countrySheet.getRange(1, 1, allCountryRows.length, 10).setValues(allCountryRows);
 
   const cSym = String(data.currency_symbol || '$').replace(/"/g, '');
   const currFmt = cSym === '$' ? '$#,##0.00' : '"' + cSym + '"#,##0.00';
 
-  let dailySheet = ss.getSheetByName('Daily_Data') || ss.insertSheet('Daily_Data');
+  const dailySheet = ss.getSheetByName('Daily_Data') || ss.insertSheet('Daily_Data');
   dailySheet.clearContents();
-  if (dailySheet.getMaxColumns() < 8) {
-    dailySheet.insertColumnsAfter(dailySheet.getMaxColumns(), 8 - dailySheet.getMaxColumns());
+  if (dailySheet.getMaxColumns() < 14) {
+    dailySheet.insertColumnsAfter(dailySheet.getMaxColumns(), 14 - dailySheet.getMaxColumns());
   }
   const dailyHeader = [[
-    'Date', 'Raw_Date', 'Ad Exchange Revenue', 'On-platform multicall Revenue', 'Total Revenue',
-    'Ad Exchange Impressions', 'On-platform multicall Impressions', 'Total Impressions'
+    'Date', 'Raw_Date', 'Primary Programmatic Revenue', 'OPMC Revenue', 'Total Revenue',
+    'Primary Impressions', 'OPMC Impressions', 'Total Impressions',
+    'OPMC Ad Exchange Revenue', 'OPMC Open Bidding Revenue', 'OPMC SDK Bidding Revenue',
+    'Primary Ad Exchange Revenue', 'Primary Open Bidding Revenue', 'Primary SDK Bidding Revenue'
   ]];
   const dailyValues = (data.daily.labels || []).map(function(lbl, idx) {
     return [
@@ -2880,22 +3417,28 @@ function writeResultsToSheets_(data, params) {
       data.daily.total[idx] || 0,
       (data.daily.adx_impressions && data.daily.adx_impressions[idx]) || 0,
       (data.daily.opmc_impressions && data.daily.opmc_impressions[idx]) || 0,
-      (data.daily.total_impressions && data.daily.total_impressions[idx]) || 0
+      (data.daily.total_impressions && data.daily.total_impressions[idx]) || 0,
+      (data.daily.opmc_adx && data.daily.opmc_adx[idx]) || 0,
+      (data.daily.opmc_ob && data.daily.opmc_ob[idx]) || 0,
+      (data.daily.opmc_sdkb && data.daily.opmc_sdkb[idx]) || 0,
+      (data.daily.prim_adx && data.daily.prim_adx[idx]) || 0,
+      (data.daily.prim_ob && data.daily.prim_ob[idx]) || 0,
+      (data.daily.prim_sdkb && data.daily.prim_sdkb[idx]) || 0
     ];
   });
   const allDailyRows = dailyHeader.concat(dailyValues);
   if (dailySheet.getMaxRows() < allDailyRows.length + 5) {
     dailySheet.insertRowsAfter(dailySheet.getMaxRows(), allDailyRows.length + 5 - dailySheet.getMaxRows());
   }
-  dailySheet.getRange(1, 1, allDailyRows.length, 8).setValues(allDailyRows);
+  dailySheet.getRange(1, 1, allDailyRows.length, 14).setValues(allDailyRows);
   try {
     if (dailyValues.length > 0) {
       dailySheet.getRange(2, 3, dailyValues.length, 3).setNumberFormat(currFmt);
       dailySheet.getRange(2, 6, dailyValues.length, 3).setNumberFormat('#,##0');
+      dailySheet.getRange(2, 9, dailyValues.length, 6).setNumberFormat(currFmt);
     }
   } catch (e) {}
 
-  // Update the Ad Unit Breakdown tab.
   try {
     writeParentAdUnitBreakdownSheet_(ss, data);
   } catch (parentErr) {}
@@ -2907,19 +3450,22 @@ function writeResultsToSheets_(data, params) {
     if (!isStackedDatesLayout) {
       dash.getRange('I8').setValue(data.currency_code || 'USD');
     }
+    dash.getRange('C12').setValue('ALL');
+    dash.getRange('F12').setValue('ALL');
+    dash.getRange('I12').setValue('ALL');
     try {
-      dash.getRange('B15').setNumberFormat(currFmt);
-      dash.getRange('E15').setNumberFormat(currFmt);
-      dash.getRange('H15').setNumberFormat(currFmt);
+      dash.getRange('B15:C15').setNumberFormat(currFmt);
+      dash.getRange('E15:F15').setNumberFormat(currFmt);
+      dash.getRange('H15:I15').setNumberFormat(currFmt);
     } catch (e) {}
   }
 
-  // Update daily revenue & eCPM rows, top 10 countries, filter dropdown lists, and currency code in Chart_Helper.
+  // Update Chart_Helper daily formulas, channel breakdown, top 10 countries, options, and currency code.
   const helperSheet = ss.getSheetByName('Chart_Helper');
   if (helperSheet) {
     try {
-      if (helperSheet.getMaxColumns() < 20) {
-        helperSheet.insertColumnsAfter(helperSheet.getMaxColumns(), 20 - helperSheet.getMaxColumns());
+      if (helperSheet.getMaxColumns() < 26) {
+        helperSheet.insertColumnsAfter(helperSheet.getMaxColumns(), 26 - helperSheet.getMaxColumns());
       }
       const numDaily = (data.daily && data.daily.labels) ? data.daily.labels.length : 0;
       const neededRows = Math.max(numDaily + 5, 405);
@@ -2928,51 +3474,73 @@ function writeResultsToSheets_(data, params) {
       }
 
       helperSheet.getRange('M1:M2').setValues([['Currency_Code'], [data.currency_code || 'USD']]);
+      helperSheet.getRange('T1:T5').setValues([['Demand_Channel_Options'], ['ALL'], ['Ad Exchange'], ['Open Bidding'], ['SDK Bidding']]);
+      helperSheet.getRange('A1:D1').setValues([['Date', 'Total Revenue', 'Primary Programmatic Revenue', 'OPMC Revenue']]);
       helperSheet.getRange('N1:S1').setValues([[
-        'Ad Exchange Impressions', 'On-platform multicall Impressions', 'Total Impressions',
-        'Total eCPM', 'Ad Exchange eCPM', 'On-platform multicall eCPM'
+        'Primary Impressions', 'OPMC Impressions', 'Total Impressions',
+        'Total eCPM', 'Primary eCPM', 'OPMC eCPM'
       ]]);
+      helperSheet.getRange('U1:W1').setValues([['OPMC — Ad Exchange', 'OPMC — Open Bidding', 'OPMC — SDK Bidding']]);
 
       const clearSpan = Math.max(helperSheet.getLastRow(), 400);
       helperSheet.getRange(2, 1, clearSpan, 4).clearContent();
       helperSheet.getRange(2, 14, clearSpan, 6).clearContent();
+      helperSheet.getRange(2, 21, clearSpan, 3).clearContent();
 
+      const chCrit = 'IF(OR(Overview!$I$12="ALL",Overview!$I$12=""),"*",Overview!$I$12)';
       if (numDaily > 0) {
         const helperDailyFormulas = [];
         const helperEcpmFormulas = [];
+        const helperOpmcChFormulas = [];
         for (let dIdx = 0; dIdx < numDaily; dIdx++) {
           const rNum = dIdx + 2;
           helperDailyFormulas.push([
             '=Daily_Data!A' + rNum,
             '=C' + rNum + '+D' + rNum,
-            '=IF(Overview!$C$12<>"ALL", SUMIFS(Ad_Unit_Data!$D$2:$D, Ad_Unit_Data!$A$2:$A, A' + rNum + ', Ad_Unit_Data!$C$2:$C, Overview!$C$12), IF(Overview!$F$12<>"ALL", SUMIFS(Country_Data!$D$2:$D, Country_Data!$A$2:$A, A' + rNum + ', Country_Data!$C$2:$C, Overview!$F$12), Daily_Data!C' + rNum + '))',
-            '=IF(Overview!$C$12<>"ALL", SUMIFS(Ad_Unit_Data!$E$2:$E, Ad_Unit_Data!$A$2:$A, A' + rNum + ', Ad_Unit_Data!$C$2:$C, Overview!$C$12), IF(Overview!$F$12<>"ALL", SUMIFS(Country_Data!$E$2:$E, Country_Data!$A$2:$A, A' + rNum + ', Country_Data!$C$2:$C, Overview!$F$12), Daily_Data!D' + rNum + '))'
+            '=IF(Overview!$C$12<>"ALL", SUMIFS(Ad_Unit_Data!$D$2:$D, Ad_Unit_Data!$A$2:$A, A' + rNum + ', Ad_Unit_Data!$C$2:$C, Overview!$C$12, Ad_Unit_Data!$K$2:$K, ' + chCrit + ') + SUMIFS(Ad_Unit_Data!$D$2:$D, Ad_Unit_Data!$A$2:$A, A' + rNum + ', Ad_Unit_Data!$J$2:$J, Overview!$C$12, Ad_Unit_Data!$K$2:$K, ' + chCrit + '), IF(Overview!$F$12<>"ALL", SUMIFS(Country_Data!$D$2:$D, Country_Data!$A$2:$A, A' + rNum + ', Country_Data!$C$2:$C, Overview!$F$12, Country_Data!$J$2:$J, ' + chCrit + '), IF(OR(Overview!$I$12="ALL",Overview!$I$12=""), Daily_Data!C' + rNum + ', SUMIFS(Ad_Unit_Data!$D$2:$D, Ad_Unit_Data!$A$2:$A, A' + rNum + ', Ad_Unit_Data!$K$2:$K, Overview!$I$12))))',
+            '=IF(Overview!$C$12<>"ALL", SUMIFS(Ad_Unit_Data!$E$2:$E, Ad_Unit_Data!$A$2:$A, A' + rNum + ', Ad_Unit_Data!$C$2:$C, Overview!$C$12, Ad_Unit_Data!$K$2:$K, ' + chCrit + ') + SUMIFS(Ad_Unit_Data!$E$2:$E, Ad_Unit_Data!$A$2:$A, A' + rNum + ', Ad_Unit_Data!$J$2:$J, Overview!$C$12, Ad_Unit_Data!$K$2:$K, ' + chCrit + '), IF(Overview!$F$12<>"ALL", SUMIFS(Country_Data!$E$2:$E, Country_Data!$A$2:$A, A' + rNum + ', Country_Data!$C$2:$C, Overview!$F$12, Country_Data!$J$2:$J, ' + chCrit + '), IF(OR(Overview!$I$12="ALL",Overview!$I$12=""), Daily_Data!D' + rNum + ', SUMIFS(Ad_Unit_Data!$E$2:$E, Ad_Unit_Data!$A$2:$A, A' + rNum + ', Ad_Unit_Data!$K$2:$K, Overview!$I$12))))'
           ]);
           helperEcpmFormulas.push([
-            '=IF(Overview!$C$12<>"ALL", SUMIFS(Ad_Unit_Data!$G$2:$G, Ad_Unit_Data!$A$2:$A, A' + rNum + ', Ad_Unit_Data!$C$2:$C, Overview!$C$12), IF(Overview!$F$12<>"ALL", SUMIFS(Country_Data!$G$2:$G, Country_Data!$A$2:$A, A' + rNum + ', Country_Data!$C$2:$C, Overview!$F$12), Daily_Data!F' + rNum + '))',
-            '=IF(Overview!$C$12<>"ALL", SUMIFS(Ad_Unit_Data!$H$2:$H, Ad_Unit_Data!$A$2:$A, A' + rNum + ', Ad_Unit_Data!$C$2:$C, Overview!$C$12), IF(Overview!$F$12<>"ALL", SUMIFS(Country_Data!$H$2:$H, Country_Data!$A$2:$A, A' + rNum + ', Country_Data!$C$2:$C, Overview!$F$12), Daily_Data!G' + rNum + '))',
+            '=IF(Overview!$C$12<>"ALL", SUMIFS(Ad_Unit_Data!$G$2:$G, Ad_Unit_Data!$A$2:$A, A' + rNum + ', Ad_Unit_Data!$C$2:$C, Overview!$C$12, Ad_Unit_Data!$K$2:$K, ' + chCrit + ') + SUMIFS(Ad_Unit_Data!$G$2:$G, Ad_Unit_Data!$A$2:$A, A' + rNum + ', Ad_Unit_Data!$J$2:$J, Overview!$C$12, Ad_Unit_Data!$K$2:$K, ' + chCrit + '), IF(Overview!$F$12<>"ALL", SUMIFS(Country_Data!$G$2:$G, Country_Data!$A$2:$A, A' + rNum + ', Country_Data!$C$2:$C, Overview!$F$12, Country_Data!$J$2:$J, ' + chCrit + '), IF(OR(Overview!$I$12="ALL",Overview!$I$12=""), Daily_Data!F' + rNum + ', SUMIFS(Ad_Unit_Data!$G$2:$G, Ad_Unit_Data!$A$2:$A, A' + rNum + ', Ad_Unit_Data!$K$2:$K, Overview!$I$12))))',
+            '=IF(Overview!$C$12<>"ALL", SUMIFS(Ad_Unit_Data!$H$2:$H, Ad_Unit_Data!$A$2:$A, A' + rNum + ', Ad_Unit_Data!$C$2:$C, Overview!$C$12, Ad_Unit_Data!$K$2:$K, ' + chCrit + ') + SUMIFS(Ad_Unit_Data!$H$2:$H, Ad_Unit_Data!$A$2:$A, A' + rNum + ', Ad_Unit_Data!$J$2:$J, Overview!$C$12, Ad_Unit_Data!$K$2:$K, ' + chCrit + '), IF(Overview!$F$12<>"ALL", SUMIFS(Country_Data!$H$2:$H, Country_Data!$A$2:$A, A' + rNum + ', Country_Data!$C$2:$C, Overview!$F$12, Country_Data!$J$2:$J, ' + chCrit + '), IF(OR(Overview!$I$12="ALL",Overview!$I$12=""), Daily_Data!G' + rNum + ', SUMIFS(Ad_Unit_Data!$H$2:$H, Ad_Unit_Data!$A$2:$A, A' + rNum + ', Ad_Unit_Data!$K$2:$K, Overview!$I$12))))',
             '=N' + rNum + '+O' + rNum,
             '=IF(P' + rNum + '>0, (B' + rNum + '/P' + rNum + ')*1000, 0)',
             '=IF(N' + rNum + '>0, (C' + rNum + '/N' + rNum + ')*1000, 0)',
             '=IF(O' + rNum + '>0, (D' + rNum + '/O' + rNum + ')*1000, 0)'
           ]);
+          const chPairs = [['Ad Exchange', 'I'], ['Open Bidding', 'J'], ['SDK Bidding', 'K']];
+          helperOpmcChFormulas.push(chPairs.map(function(pair) {
+            const chName = pair[0];
+            const dailyCol = pair[1];
+            return (
+              '=IF(AND(Overview!$I$12<>"ALL", Overview!$I$12<>"", Overview!$I$12<>"' + chName + '"), 0, ' +
+              'IF(Overview!$C$12<>"ALL", SUMIFS(Ad_Unit_Data!$E$2:$E, Ad_Unit_Data!$A$2:$A, A' + rNum + ', Ad_Unit_Data!$C$2:$C, Overview!$C$12, Ad_Unit_Data!$K$2:$K, "' + chName + '") + ' +
+              'SUMIFS(Ad_Unit_Data!$E$2:$E, Ad_Unit_Data!$A$2:$A, A' + rNum + ', Ad_Unit_Data!$J$2:$J, Overview!$C$12, Ad_Unit_Data!$K$2:$K, "' + chName + '"), ' +
+              'IF(Overview!$F$12<>"ALL", SUMIFS(Country_Data!$E$2:$E, Country_Data!$A$2:$A, A' + rNum + ', Country_Data!$C$2:$C, Overview!$F$12, Country_Data!$J$2:$J, "' + chName + '"), ' +
+              'Daily_Data!' + dailyCol + rNum + ')))'
+            );
+          }));
         }
         helperSheet.getRange(2, 1, numDaily, 4).setFormulas(helperDailyFormulas);
         helperSheet.getRange(2, 14, numDaily, 6).setFormulas(helperEcpmFormulas);
+        helperSheet.getRange(2, 21, numDaily, 3).setFormulas(helperOpmcChFormulas);
         try {
           const fmtSpan = Math.max(numDaily, 400);
           helperSheet.getRange(2, 2, fmtSpan, 3).setNumberFormat(currFmt);
           helperSheet.getRange(2, 14, fmtSpan, 3).setNumberFormat('#,##0');
           helperSheet.getRange(2, 17, fmtSpan, 3).setNumberFormat(currFmt);
+          helperSheet.getRange(2, 21, fmtSpan, 3).setNumberFormat(currFmt);
         } catch (fmtErr) {}
       } else {
         const emptyLbl = (params && params.start_date && formatDateLabel_(params.start_date)) || '—';
         helperSheet.getRange('A2:D2').setValues([[emptyLbl, 0, 0, 0]]);
         helperSheet.getRange('N2:S2').setValues([[0, 0, 0, 0, 0, 0]]);
+        helperSheet.getRange('U2:W2').setValues([[0, 0, 0]]);
         try {
           helperSheet.getRange(2, 2, 400, 3).setNumberFormat(currFmt);
           helperSheet.getRange(2, 14, 400, 3).setNumberFormat('#,##0');
           helperSheet.getRange(2, 17, 400, 3).setNumberFormat(currFmt);
+          helperSheet.getRange(2, 21, 400, 3).setNumberFormat(currFmt);
         } catch (fmtErr) {}
       }
 
@@ -2985,15 +3553,15 @@ function writeResultsToSheets_(data, params) {
       const top10Countries = Object.keys(cTotals)
         .sort(function(a, b) { return cTotals[b] - cTotals[a]; })
         .slice(0, 10);
-      helperSheet.getRange('F1:I1').setValues([['Country', 'Ad Exchange Revenue', 'On-platform multicall Revenue', 'Total Revenue']]);
+      helperSheet.getRange('F1:I1').setValues([['Country', 'Primary Programmatic Revenue', 'OPMC Revenue', 'Total Revenue']]);
       const countryNames = [];
       const countryFormulas = [];
       for (let t = 0; t < 10; t++) {
         const rNum = t + 2;
         countryNames.push([top10Countries[t] || '']);
         countryFormulas.push([
-          '=IF(F' + rNum + '="", 0, IF(OR(Overview!$F$12="ALL", Overview!$F$12=F' + rNum + '), SUMIF(Country_Data!$C$2:$C, F' + rNum + ', Country_Data!$D$2:$D), 0))',
-          '=IF(F' + rNum + '="", 0, IF(OR(Overview!$F$12="ALL", Overview!$F$12=F' + rNum + '), SUMIF(Country_Data!$C$2:$C, F' + rNum + ', Country_Data!$E$2:$E), 0))',
+          '=IF(F' + rNum + '="", 0, IF(OR(Overview!$F$12="ALL", Overview!$F$12=F' + rNum + '), SUMIFS(Country_Data!$D$2:$D, Country_Data!$C$2:$C, F' + rNum + ', Country_Data!$J$2:$J, ' + chCrit + '), 0))',
+          '=IF(F' + rNum + '="", 0, IF(OR(Overview!$F$12="ALL", Overview!$F$12=F' + rNum + '), SUMIFS(Country_Data!$E$2:$E, Country_Data!$C$2:$C, F' + rNum + ', Country_Data!$J$2:$J, ' + chCrit + '), 0))',
           '=G' + rNum + '+H' + rNum
         ]);
       }
@@ -3012,12 +3580,20 @@ function writeResultsToSheets_(data, params) {
       helperSheet.getRange(1, 12, countryOpts.length, 1).setValues(countryOpts);
 
       if (dash) {
+        dash.getRange('C12').setDataValidation(
+          SpreadsheetApp.newDataValidation().requireValueInRange(helperSheet.getRange(2, 11, Math.max(unitOpts.length, 500), 1), true).setAllowInvalid(true).build()
+        );
+        dash.getRange('F12').setDataValidation(
+          SpreadsheetApp.newDataValidation().requireValueInRange(helperSheet.getRange(2, 12, Math.max(countryOpts.length, 300), 1), true).setAllowInvalid(true).build()
+        );
+        dash.getRange('I12').setDataValidation(
+          SpreadsheetApp.newDataValidation().requireValueInRange(helperSheet.getRange('T2:T5'), true).setAllowInvalid(true).build()
+        );
         syncOverviewCharts_(dash, helperSheet, numDaily, data.currency_code || 'USD');
       }
     } catch (helperErr) {}
   }
 
-  // Hide the raw data tabs and the helper tab.
   [unitSheet, countrySheet, dailySheet, helperSheet].forEach(function(s) {
     if (s) {
       try {
@@ -3030,7 +3606,7 @@ function writeResultsToSheets_(data, params) {
 }
 
 /**
- * Updates the exact daily row range and currency title on the Overview charts.
+ * Updates the exact daily row range and currency titles across the 5 v1.3 Overview charts.
  */
 function syncOverviewCharts_(overview, helperSheet, numDaily, currencyCode) {
   if (!overview || !helperSheet) return;
@@ -3038,51 +3614,60 @@ function syncOverviewCharts_(overview, helperSheet, numDaily, currencyCode) {
     const endRow = Math.max((Number(numDaily) || 0) + 1, 2);
     const curr = String(currencyCode || 'USD').trim().toUpperCase() || 'USD';
     const charts = overview.getCharts() || [];
+    if (charts.length !== 5) {
+      insertOverviewCharts_(overview, helperSheet, Number(numDaily) || 0, curr);
+      return;
+    }
+    const vAxisStyle = { fontName: 'Roboto', fontSize: 10 };
     charts.forEach(function(ch) {
       try {
         const info = ch.getContainerInfo();
         const r = info ? info.getAnchorRow() : 0;
         if (r >= 18 && r <= 22) {
-          const updated = ch
+          const updated1 = ch
             .modify()
             .clearRanges()
             .addRange(helperSheet.getRange(1, 1, endRow, 4))
-            .setOption('title', 'Daily Revenue Trends (' + curr + ')')
-            .setOption('vAxis', { title: 'Revenue (' + curr + ')', textStyle: { fontName: 'Roboto', fontSize: 10 } })
+            .setOption('title', 'Revenue Trends (' + curr + ')')
+            .setOption('vAxis', { title: 'Revenue (' + curr + ')', textStyle: vAxisStyle })
             .build();
-          overview.updateChart(updated);
+          overview.updateChart(updated1);
         } else if (r >= 37 && r <= 41) {
-          const b37 = String(overview.getRange('B37').getDisplayValue() || '').toLowerCase();
-          if (b37.indexOf('ecpm') !== -1) {
-            const updated = ch
-              .modify()
-              .clearRanges()
-              .addRange(helperSheet.getRange(1, 1, endRow, 1))
-              .addRange(helperSheet.getRange(1, 17, endRow, 3))
-              .setOption('title', 'Daily eCPM Trends (' + curr + ')')
-              .setOption('vAxis', { title: 'eCPM (' + curr + ')', textStyle: { fontName: 'Roboto', fontSize: 10 } })
-              .build();
-            overview.updateChart(updated);
-          } else {
-            const updated = ch
-              .modify()
-              .clearRanges()
-              .addRange(helperSheet.getRange(1, 1, endRow, 1))
-              .addRange(helperSheet.getRange(1, 3, endRow, 2))
-              .build();
-            overview.updateChart(updated);
-          }
+          const updated2 = ch
+            .modify()
+            .clearRanges()
+            .addRange(helperSheet.getRange(1, 1, endRow, 1))
+            .addRange(helperSheet.getRange(1, 21, endRow, 3))
+            .setOption('vAxis', { title: 'OPMC Revenue (' + curr + ')', textStyle: vAxisStyle })
+            .build();
+          overview.updateChart(updated2);
         } else if (r >= 56 && r <= 60) {
-          const b56 = String(overview.getRange('B56').getDisplayValue() || '').toLowerCase();
-          if (b56.indexOf('stacked') !== -1) {
-            const updated = ch
-              .modify()
-              .clearRanges()
-              .addRange(helperSheet.getRange(1, 1, endRow, 1))
-              .addRange(helperSheet.getRange(1, 3, endRow, 2))
-              .build();
-            overview.updateChart(updated);
-          }
+          const updated3 = ch
+            .modify()
+            .clearRanges()
+            .addRange(helperSheet.getRange(1, 1, endRow, 1))
+            .addRange(helperSheet.getRange(1, 17, endRow, 3))
+            .setOption('title', 'eCPM Trends (' + curr + ')')
+            .setOption('vAxis', { title: 'eCPM (' + curr + ')', textStyle: vAxisStyle })
+            .build();
+          overview.updateChart(updated3);
+        } else if (r >= 75 && r <= 79) {
+          const updated4 = ch
+            .modify()
+            .clearRanges()
+            .addRange(helperSheet.getRange(1, 1, endRow, 1))
+            .addRange(helperSheet.getRange(1, 3, endRow, 2))
+            .setOption('vAxis', { title: 'Combined Revenue (' + curr + ')', textStyle: vAxisStyle })
+            .build();
+          overview.updateChart(updated4);
+        } else if (r >= 94 && r <= 98) {
+          const updated5 = ch
+            .modify()
+            .clearRanges()
+            .addRange(helperSheet.getRange(1, 6, 11, 3))
+            .setOption('vAxis', { title: 'Revenue (' + curr + ')', textStyle: vAxisStyle })
+            .build();
+          overview.updateChart(updated5);
         }
       } catch (innerErr) {}
     });
@@ -3149,6 +3734,23 @@ function readExistingSheetDataForModal_() {
     const currencyCode = /^[A-Z]{3}$/.test(rawCurr) ? rawCurr : 'USD';
     const currSymbol = CURRENCY_SYMBOLS[currencyCode] || '$';
 
+    const manualParentMap = {};
+    try {
+      const breakdownSheet = ss.getSheetByName('Ad Unit Breakdown');
+      if (breakdownSheet && breakdownSheet.getLastRow() > 14) {
+        const bdVals = breakdownSheet.getDataRange().getValues();
+        for (let b = 0; b < bdVals.length; b++) {
+          const disp = String(bdVals[b][1] || '');
+          const role = String(bdVals[b][2] || '');
+          const assigned = String(bdVals[b][3] || '').trim();
+          if (role.indexOf('OPMC Child Unit') !== -1 && assigned) {
+            const rawChild = disp.replace(/^[\s↳]+/, '').trim();
+            if (rawChild) manualParentMap[rawChild] = assigned;
+          }
+        }
+      }
+    } catch (bdErr) {}
+
     const adUnitRows = [];
     for (let i = 1; i < uVals.length; i++) {
       const r = uVals[i];
@@ -3162,11 +3764,16 @@ function readExistingSheetDataForModal_() {
       const adxImp = Number(r[6]) || 0;
       const opmcImp = Number(r[7]) || 0;
       const imp = Number(r[8] || (adxImp + opmcImp)) || 0;
+      const parentStr = String(r[9] || '').trim();
+      const demandChannel = String(r[10] || 'Ad Exchange').trim() || 'Ad Exchange';
 
       adUnitRows.push({
         date: d,
         raw_date: rawD,
         ad_unit: unit,
+        parent_ad_unit: parentStr,
+        manual_parent: manualParentMap[unit] || '',
+        demand_channel: demandChannel,
         adx_revenue: Math.round(adx * 100) / 100,
         opmc_revenue: Math.round(opmc * 100) / 100,
         total_revenue: Math.round(tot * 100) / 100,
@@ -3186,15 +3793,21 @@ function readExistingSheetDataForModal_() {
       const adx = Number(cr[3]) || 0;
       const opmc = Number(cr[4]) || 0;
       const tot = Number(cr[5]) || (adx + opmc);
-      const imp = Number(cr[8] || cr[6]) || 0;
+      const adxImp = Number(cr[6]) || 0;
+      const opmcImp = Number(cr[7]) || 0;
+      const imp = Number(cr[8] || (adxImp + opmcImp)) || 0;
+      const demandChannel = String(cr[9] || 'Ad Exchange').trim() || 'Ad Exchange';
 
       countryRows.push({
         date: d,
         raw_date: rawD,
         country: country,
+        demand_channel: demandChannel,
         adx_revenue: Math.round(adx * 100) / 100,
         opmc_revenue: Math.round(opmc * 100) / 100,
         total_revenue: Math.round(tot * 100) / 100,
+        adx_impressions: Math.round(adxImp),
+        opmc_impressions: Math.round(opmcImp),
         total_impressions: Math.round(imp)
       });
     }
